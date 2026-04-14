@@ -45,3 +45,67 @@ Elementti is implemented in Python and uses the following main packages:
 
 ```bash
 pip install -r requirements.txt
+```
+
+## How to run
+
+Run the program with:
+
+```bash
+python src/elementti.py
+```
+
+## Sample data
+
+Sample CSV files for testing and demonstration are included in the `sample_data` folder.
+
+## Typical workflow
+
+Elementti is designed as a guided workflow. A typical use case includes:
+
+1. import CSV files
+2. assign names to the imported maps
+3. select direct outputs and ratio maps
+4. define preprocessing settings
+5. optionally apply masking or other rule-based processing
+6. choose visualization settings
+7. export processed data and figure files
+
+## Output files
+
+Depending on the selected options, Elementti can export:
+
+- processed CSV files
+- figure files
+- a JSON summary file containing selected processing and visualization settings
+- a plain-text methods file summarizing the workflow
+
+## Intended use
+
+Elementti is intended for processing and visualization of SEM-EDS elemental maps exported in CSV format. The software is designed to support reproducible and consistent post-processing of elemental mapping data in microscopy-related applications.
+
+## Development
+
+Elementti was developed in the High-Temperature Processes and Materials Group at Åbo Akademi University, Turku, Finland.
+
+## Citation
+
+If you use Elementti in research or publications, please cite the associated software manuscript:
+
+Jafarihonar, F., and Vainio, E. *Elementti: A Python-based GUI for processing and visualization of SEM-EDS elemental maps*.
+
+Full bibliographic details will be added after publication.
+
+## Status
+
+This repository contains the Elementti software described in the manuscript and may continue to be updated during manuscript preparation and revision.
+
+## Author
+
+Farzad Jafarihonar  
+Åbo Akademi University  
+Turku, Finland
+
+## License
+
+This software is distributed under the license provided in `LICENSE.txt`.
