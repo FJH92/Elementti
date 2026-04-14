@@ -1,4 +1,3 @@
-
 # Elementti
 
 Elementti is a Python-based graphical user interface for processing and visualization of SEM-EDS elemental maps exported in CSV format.
@@ -15,11 +14,10 @@ Elementti is a Python-based graphical user interface for processing and visualiz
 - export processed arrays and figure files
 - save processing and visualization settings in a JSON summary file
 
-## Source code
+## Repository contents
 
-The main source code is located in:
-
-`src/elementti.py`
+- `src/elementti.py` – main source code
+- `sample_data/` – sample CSV files for demonstration
 
 ## Requirements
 
@@ -31,4 +29,4 @@ Elementti is implemented in Python and uses:
 
 ## Status
 
-This repository contains the Elementti software and will be updated during manuscript preparation and revision.
+This repository contains the Elementti software described in the manuscript and will be updated during manuscript preparation and revision.
