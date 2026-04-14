@@ -90,9 +90,7 @@ Elementti was developed in the High-Temperature Processes and Materials Group at
 
 ## Citation
 
-If you use Elementti in research or publications, please cite the associated software manuscript:
 
-Jafarihonar, F., and Vainio, E. *Elementti: A Python-based GUI for processing and visualization of SEM-EDS elemental maps*.
 
 Full bibliographic details will be added after publication.
 
