@@ -12,6 +12,7 @@ import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")
+matplotlib.rcParams["font.family"] = "Arial"
 import matplotlib.pyplot as plt
 from matplotlib.colors import (
     is_color_like,
@@ -24,7 +25,7 @@ from matplotlib.colors import (
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QWizard,
@@ -55,8 +56,9 @@ APP_DEVELOPER_TEXT = (
 
 APP_CITATION_TEXT = (
     "If you use Elementti in your work, please cite: "
-    "F. Jafarihonar and E. Vainio, 2026. "
-    "Elementti: A Python-based GUI for processing and visualization of SEM-EDS elemental maps."
+    "Jafarihonar, F. and Vainio, E. Elementti,:" 
+    "A Python-based GUI for processing and visualization of SEM-EDS elemental maps," 
+    "(manuscript in preparation)"
 )
 
 
@@ -119,6 +121,34 @@ def parse_bins_text(bins_text: str) -> List[float]:
 
 def parse_color_list(color_text: str) -> List[str]:
     return [c.strip() for c in color_text.split(",") if c.strip()]
+
+
+GRAYSCALE_CONDITIONS = ["below", "above", "between", "outside"]
+CONDITIONAL_OPERATORS = ["above", "below", "between"]
+
+
+def normalize_grayscale_condition(condition: str) -> str:
+    value = condition.strip().lower()
+    if value in ("below", "<="):
+        return "below"
+    if value in ("above", ">="):
+        return "above"
+    if value == "between":
+        return "between"
+    if value == "outside":
+        return "outside"
+    return condition.strip()
+
+
+def normalize_conditional_operator(operator: str) -> str:
+    value = operator.strip().lower()
+    if value in (">", ">=", "above"):
+        return "above"
+    if value in ("<", "<=", "below"):
+        return "below"
+    if value == "between":
+        return "between"
+    return operator.strip()
 
 
 def is_grayscale_name(name: str) -> bool:
@@ -270,7 +300,8 @@ class LowValueRule:
 class GrayscaleMaskRule:
     enabled: bool = True
     source_name: str = ""
-    condition: str = "below"   # below, above, between, outside
+    target_output_name: str = "All outputs"
+    condition: str = "below"
     value_a: str = ""
     value_b: str = ""
     color: str = "white"
@@ -280,7 +311,7 @@ class GrayscaleMaskRule:
 class ConditionalReplacementRule:
     enabled: bool = True
     condition_source_name: str = ""
-    condition_operator: str = ">"
+    condition_operator: str = "above"
     value_a: str = ""
     value_b: str = ""
     target_name: str = ""
@@ -332,6 +363,11 @@ class AppState:
             for path in self.selected_file_paths
             if path in self.renamed_names_by_path
         }
+
+    def get_output_names(self) -> List[str]:
+        outputs = list(self.selected_maps)
+        outputs.extend(f"{num} / {den}" for num, den in self.selected_ratios)
+        return outputs
 
 
 class ProcessingEngine:
@@ -462,7 +498,7 @@ class ProcessingEngine:
 
             floor_value = float(floor_text)
             finite_mask = np.isfinite(arr)
-            arr[finite_mask & (arr < floor_value)] = floor_value
+            arr[finite_mask & (arr <= floor_value)] = floor_value
 
         return output
 
@@ -479,7 +515,7 @@ class ProcessingEngine:
 
             source_name = rule.condition_source_name.strip()
             target_name = rule.target_name.strip()
-            operator = rule.condition_operator.strip()
+            operator = normalize_conditional_operator(rule.condition_operator)
             replacement_text = rule.replacement_value.strip()
 
             if source_name == "" or target_name == "" or replacement_text == "":
@@ -518,13 +554,9 @@ class ProcessingEngine:
                     raise ValueError(f"Conditional replacement rule {idx} requires Value A.")
                 a = float(a_text)
 
-                if operator == ">":
-                    condition_mask = np.isfinite(source_arr) & (source_arr > a)
-                elif operator == ">=":
+                if operator == "above":
                     condition_mask = np.isfinite(source_arr) & (source_arr >= a)
-                elif operator == "<":
-                    condition_mask = np.isfinite(source_arr) & (source_arr < a)
-                elif operator == "<=":
+                elif operator == "below":
                     condition_mask = np.isfinite(source_arr) & (source_arr <= a)
                 else:
                     raise ValueError(f"Conditional replacement rule {idx} uses unknown operator '{operator}'.")
@@ -538,6 +570,13 @@ class ProcessingEngine:
         working = self.apply_conditional_replacements(working)
         return working
 
+    @staticmethod
+    def grayscale_rule_applies_to_output(rule: GrayscaleMaskRule, output_name: Optional[str]) -> bool:
+        target = rule.target_output_name.strip()
+        if output_name is None:
+            return True
+        return target == "" or target == "All outputs" or target == output_name
+
     def build_grayscale_rule_mask(
         self,
         raw_arrays_by_name: Dict[str, np.ndarray],
@@ -545,7 +584,7 @@ class ProcessingEngine:
         rule_index: int,
     ) -> np.ndarray:
         source_name = rule.source_name.strip()
-        condition = rule.condition.strip().lower()
+        condition = normalize_grayscale_condition(rule.condition)
 
         if source_name == "":
             raise ValueError(f"Grayscale mask rule {rule_index} has no source file.")
@@ -560,8 +599,8 @@ class ProcessingEngine:
             a = float(rule.value_a)
 
             if condition == "below":
-                return np.isfinite(source_array) & (source_array < a)
-            return np.isfinite(source_array) & (source_array > a)
+                return np.isfinite(source_array) & (source_array <= a)
+            return np.isfinite(source_array) & (source_array >= a)
 
         if condition in ("between", "outside"):
             if rule.value_a.strip() == "" or rule.value_b.strip() == "":
@@ -578,13 +617,21 @@ class ProcessingEngine:
 
         raise ValueError(f"Grayscale mask rule {rule_index} uses unknown condition '{condition}'.")
 
-    def build_combined_grayscale_mask(self, raw_arrays_by_name: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+    def build_combined_grayscale_mask(
+        self,
+        raw_arrays_by_name: Dict[str, np.ndarray],
+        output_name: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
         settings = self.state.masking_and_noise_settings
 
         if not settings.enabled or not settings.grayscale_enabled:
             return None
 
-        active_rules = [rule for rule in settings.grayscale_rules if rule.enabled]
+        active_rules = [
+            rule
+            for rule in settings.grayscale_rules
+            if rule.enabled and self.grayscale_rule_applies_to_output(rule, output_name)
+        ]
         if not active_rules:
             return None
 
@@ -605,15 +652,23 @@ class ProcessingEngine:
 
         return combined_mask
 
-    def build_grayscale_mask_layers(self, raw_arrays_by_name: Dict[str, np.ndarray]) -> List[Tuple[np.ndarray, str]]:
+    def build_grayscale_mask_layers(
+        self,
+        raw_arrays_by_name: Dict[str, np.ndarray],
+        output_name: Optional[str] = None,
+    ) -> List[Tuple[np.ndarray, str]]:
         settings = self.state.masking_and_noise_settings
 
         if not settings.enabled or not settings.grayscale_enabled:
             return []
 
-        layers = []
-        active_rules = [rule for rule in settings.grayscale_rules if rule.enabled]
+        active_rules = [
+            rule
+            for rule in settings.grayscale_rules
+            if rule.enabled and self.grayscale_rule_applies_to_output(rule, output_name)
+        ]
 
+        layers = []
         for idx, rule in enumerate(active_rules, start=1):
             rule_mask = self.build_grayscale_rule_mask(raw_arrays_by_name, rule, idx)
             layers.append((rule_mask, rule.color.strip() or "white"))
@@ -633,11 +688,11 @@ class ProcessingEngine:
     def compute_output_stats(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
         raw_arrays = self.load_raw_arrays()
         working_arrays = self.apply_processing_rules(raw_arrays)
-        display_mask = self.build_combined_grayscale_mask(raw_arrays)
 
         result: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
         for name, arr in working_arrays.items():
+            display_mask = self.build_combined_grayscale_mask(raw_arrays, output_name=name)
             finite = self.get_visible_finite_values(arr, mask=display_mask)
             result[name] = (
                 None if finite.size == 0 else float(np.min(finite)),
@@ -661,8 +716,10 @@ class ProcessingEngine:
                 ratio_arr = num_arr / den_arr
                 ratio_arr[~np.isfinite(ratio_arr)] = np.nan
 
+            ratio_name = f"{num} / {den}"
+            display_mask = self.build_combined_grayscale_mask(raw_arrays, output_name=ratio_name)
             finite = self.get_visible_finite_values(ratio_arr, mask=display_mask)
-            result[f"{num} / {den}"] = (
+            result[ratio_name] = (
                 None if finite.size == 0 else float(np.min(finite)),
                 None if finite.size == 0 else float(np.max(finite)),
             )
@@ -753,7 +810,14 @@ class ProcessingEngine:
             overlay[rule_mask] = to_rgba(rule_color)
             ax.imshow(overlay, interpolation="nearest")
 
-        cbar.set_label(settings.colorbar_label.strip() or output_name)
+        
+        cbar.set_label(
+            settings.colorbar_label.strip() or output_name,
+            fontname="Arial"
+        )
+
+        for tick in cbar.ax.get_yticklabels():
+            tick.set_fontname("Arial")
 
         if side == "left":
             cbar.ax.yaxis.set_label_position("left")
@@ -795,7 +859,8 @@ class ProcessingEngine:
             grayscale_rules.append({
                 "enabled": rule.enabled,
                 "source_name": rule.source_name,
-                "condition": rule.condition,
+                "target_output_name": rule.target_output_name,
+                "condition": normalize_grayscale_condition(rule.condition),
                 "value_a": rule.value_a,
                 "value_b": rule.value_b,
                 "color": rule.color,
@@ -806,7 +871,7 @@ class ProcessingEngine:
             conditional_rules.append({
                 "enabled": rule.enabled,
                 "condition_source_name": rule.condition_source_name,
-                "condition_operator": rule.condition_operator,
+                "condition_operator": normalize_conditional_operator(rule.condition_operator),
                 "value_a": rule.value_a,
                 "value_b": rule.value_b,
                 "target_name": rule.target_name,
@@ -912,16 +977,19 @@ class ProcessingEngine:
             active_grayscale_rules = [rule for rule in ms.grayscale_rules if rule.enabled]
             if active_grayscale_rules:
                 for idx, rule in enumerate(active_grayscale_rules, start=1):
-                    if rule.condition == "between":
+                    condition = normalize_grayscale_condition(rule.condition)
+                    if condition == "between":
                         condition_text = f"{rule.source_name} between {rule.value_a} and {rule.value_b}"
-                    elif rule.condition == "outside":
+                    elif condition == "outside":
                         condition_text = f"{rule.source_name} outside {rule.value_a} and {rule.value_b}"
-                    elif rule.condition == "above":
+                    elif condition == "above":
                         condition_text = f"{rule.source_name} above {rule.value_a}"
                     else:
                         condition_text = f"{rule.source_name} below {rule.value_a}"
 
-                    lines.append(f"  - Rule {idx}: mask pixels where {condition_text}")
+                    lines.append(
+                        f"  - Rule {idx}: apply to {rule.target_output_name}; mask pixels where {condition_text}"
+                    )
                     lines.append(f"    Color: {rule.color}")
             else:
                 lines.append("  - None")
@@ -941,10 +1009,13 @@ class ProcessingEngine:
             active_conditional_rules = [rule for rule in ms.conditional_rules if rule.enabled]
             if active_conditional_rules:
                 for idx, rule in enumerate(active_conditional_rules, start=1):
-                    if rule.condition_operator == "between":
+                    operator = normalize_conditional_operator(rule.condition_operator)
+                    if operator == "between":
                         condition_text = f"{rule.condition_source_name} between {rule.value_a} and {rule.value_b}"
+                    elif operator == "above":
+                        condition_text = f"{rule.condition_source_name} above {rule.value_a}"
                     else:
-                        condition_text = f"{rule.condition_source_name} {rule.condition_operator} {rule.value_a}"
+                        condition_text = f"{rule.condition_source_name} below {rule.value_a}"
                     lines.append(
                         f"  - Rule {idx}: if {condition_text}, set {rule.target_name} = {rule.replacement_value}"
                     )
@@ -992,7 +1063,6 @@ class ProcessingEngine:
 
         raw_arrays = self.load_raw_arrays()
         working_arrays = self.apply_processing_rules(raw_arrays)
-        mask_layers = self.build_grayscale_mask_layers(raw_arrays)
 
         for map_name in self.state.selected_maps:
             if map_name not in working_arrays:
@@ -1000,6 +1070,7 @@ class ProcessingEngine:
 
             arr = working_arrays[map_name]
             settings = self.state.display_settings[map_name]
+            mask_layers = self.build_grayscale_mask_layers(raw_arrays, output_name=map_name)
 
             file_stub = sanitize_filename(map_name)
             if prefix:
@@ -1041,6 +1112,7 @@ class ProcessingEngine:
 
             ratio_name = f"{numerator} / {denominator}"
             settings = self.state.display_settings[ratio_name]
+            mask_layers = self.build_grayscale_mask_layers(raw_arrays, output_name=ratio_name)
 
             file_stub = sanitize_filename(f"{numerator}_over_{denominator}")
             if prefix:
@@ -1082,23 +1154,35 @@ class WelcomePage(QWizardPage):
         super().__init__()
         self.setTitle("Welcome to Elementti")
         self.setSubTitle(
-            "A software for processing and visualization of SEM-EDS elemental maps, "
-            "developed by the Laboratory of High Temperature Processes and Materials at "
+            "A software for processing and visualization of SEM-EDS elemental maps.<br>"
+            "Elementti is developed by the Laboratory of High Temperature Processes and Materials at "
             "Åbo Akademi University, Finland."
         )
 
         layout = QVBoxLayout()
 
-        info = QLabel(
-            "Citation:<br><br>"
-            f"<b>{APP_CITATION_TEXT}</b><br><br>"
-            "Click Next to begin."
-        )
-        info.setWordWrap(True)
-        info.setTextFormat(Qt.RichText)
-        layout.addWidget(info)
-        layout.addStretch()
+        self.logo_label = QLabel()
+        self.logo_label.setAlignment(Qt.AlignCenter)
 
+        icon_path = "App icon.png"
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path)
+            self.logo_label.setPixmap(
+                pixmap.scaled(
+                    840, 840,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+            )
+
+        layout.addWidget(self.logo_label)
+
+        info = QLabel("")
+        info.setWordWrap(True)
+        info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info)
+
+        layout.addStretch()
         self.setLayout(layout)
 
 
@@ -1674,7 +1758,7 @@ class MaskingIntroPage(QWizardPage):
             "Available methods in the next page:\n"
             "1. Grayscale masking, using one or more grayscale rules with separate colors\n"
             "2. Low-value protection, by replacing very small values with a chosen minimum\n"
-            "3. Conditional replacement, for rules such as: if Fe > 90, then set Cl = 0\n\n"
+            "3. Conditional replacement, for rules such as: if Fe is above 90, then set Cl = 0\n\n"
             "Do you want to apply masking and noise removal?"
         )
         info.setWordWrap(True)
@@ -1737,16 +1821,20 @@ class MaskingSettingsPage(QWizardPage):
 
         grayscale_info = QLabel(
             "You may add multiple grayscale masking rules, for example:\n"
-            "- mask values below 20 with black, mask values above 240 with white, or mask values outside 20 and 240 with gray\n"
+            "- mask values below 20 with black, mask values above 240 with white,\n"
+            "  or mask values outside the range 20 to 240 with gray\n"
+            "- for 'below' and 'above', the threshold value itself is included\n"
+            "- each grayscale rule can now be applied to one chosen output or to all outputs\n"
         )
         grayscale_info.setWordWrap(True)
         layout.addWidget(grayscale_info)
 
-        self.grayscale_table = QTableWidget(0, 6)
+        self.grayscale_table = QTableWidget(0, 7)
         self.grayscale_table.setHorizontalHeaderLabels(
             [
                 "Use rule",
                 "Source file",
+                "Apply to output",
                 "Condition",
                 "Value A",
                 "Value B",
@@ -1755,10 +1843,11 @@ class MaskingSettingsPage(QWizardPage):
         )
         self.grayscale_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.grayscale_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.grayscale_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.grayscale_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.grayscale_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.grayscale_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.grayscale_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.grayscale_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.grayscale_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.grayscale_table.verticalHeader().setVisible(False)
         layout.addWidget(self.grayscale_table)
 
@@ -1806,9 +1895,10 @@ class MaskingSettingsPage(QWizardPage):
 
         conditional_info = QLabel(
             "Define rules such as:\n"
-            "- If Fe > 90, then set Cl = 0\n"
-            "- If Grey < 20, then set O = 0\n"
-            "- If Ca is between 10 and 25, then set P = 5"
+            "- If Fe is above 90, then set Cl = 0\n"
+            "- If Grey is below 20, then set O = 0\n"
+            "- If Ca is between 10 and 25, then set P = 5\n"
+            "- For 'above' and 'below', the threshold value itself is included"
         )
         conditional_info.setWordWrap(True)
         layout.addWidget(conditional_info)
@@ -1911,20 +2001,29 @@ class MaskingSettingsPage(QWizardPage):
     def populate_grayscale_table(self):
         self.grayscale_table.setRowCount(0)
         names = self.state.get_ordered_names()
+        output_names = self.state.get_output_names()
         rules = self.state.masking_and_noise_settings.grayscale_rules
 
         for rule in rules:
-            self.add_grayscale_rule_row(rule, names)
+            self.add_grayscale_rule_row(rule, names, output_names)
 
-    def add_grayscale_rule_row(self, rule: Optional[GrayscaleMaskRule] = None, names: Optional[List[str]] = None):
+    def add_grayscale_rule_row(
+        self,
+        rule: Optional[GrayscaleMaskRule] = None,
+        names: Optional[List[str]] = None,
+        output_names: Optional[List[str]] = None,
+    ):
         if names is None:
             names = self.state.get_ordered_names()
+        if output_names is None:
+            output_names = self.state.get_output_names()
 
         if rule is None:
             source_default = names[0] if names else ""
             rule = GrayscaleMaskRule(
                 enabled=True,
                 source_name=source_default,
+                target_output_name="All outputs",
                 condition="below",
                 value_a="",
                 value_b="",
@@ -1948,23 +2047,31 @@ class MaskingSettingsPage(QWizardPage):
                 source_combo.setCurrentIndex(idx)
         self.grayscale_table.setCellWidget(row, 1, source_combo)
 
+        target_combo = QComboBox()
+        target_combo.addItems(["All outputs"] + output_names)
+        target_name = rule.target_output_name.strip() or "All outputs"
+        if target_combo.findText(target_name) < 0:
+            target_combo.addItem(target_name)
+        target_combo.setCurrentText(target_name)
+        self.grayscale_table.setCellWidget(row, 2, target_combo)
+
         condition_combo = QComboBox()
-        condition_combo.addItems(["below", "above", "between", "outside"])
-        condition_combo.setCurrentText(rule.condition or "below")
+        condition_combo.addItems(GRAYSCALE_CONDITIONS)
+        condition_combo.setCurrentText(normalize_grayscale_condition(rule.condition) or "below")
         condition_combo.currentTextChanged.connect(lambda _text, r=row: self.update_grayscale_row_state(r))
-        self.grayscale_table.setCellWidget(row, 2, condition_combo)
+        self.grayscale_table.setCellWidget(row, 3, condition_combo)
 
         value_a_edit = QLineEdit(rule.value_a)
         value_a_edit.setPlaceholderText("Example: 20")
-        self.grayscale_table.setCellWidget(row, 3, value_a_edit)
+        self.grayscale_table.setCellWidget(row, 4, value_a_edit)
 
         value_b_edit = QLineEdit(rule.value_b)
         value_b_edit.setPlaceholderText("Only for between/outside")
-        self.grayscale_table.setCellWidget(row, 4, value_b_edit)
+        self.grayscale_table.setCellWidget(row, 5, value_b_edit)
 
         color_edit = QLineEdit(rule.color)
         color_edit.setPlaceholderText("Example: black or #000000")
-        self.grayscale_table.setCellWidget(row, 5, color_edit)
+        self.grayscale_table.setCellWidget(row, 6, color_edit)
 
         self.update_grayscale_row_state(row)
 
@@ -1973,16 +2080,18 @@ class MaskingSettingsPage(QWizardPage):
         for row in range(self.grayscale_table.rowCount()):
             use_combo = self.grayscale_table.cellWidget(row, 0)
             source_combo = self.grayscale_table.cellWidget(row, 1)
-            condition_combo = self.grayscale_table.cellWidget(row, 2)
-            value_a_edit = self.grayscale_table.cellWidget(row, 3)
-            value_b_edit = self.grayscale_table.cellWidget(row, 4)
-            color_edit = self.grayscale_table.cellWidget(row, 5)
+            target_combo = self.grayscale_table.cellWidget(row, 2)
+            condition_combo = self.grayscale_table.cellWidget(row, 3)
+            value_a_edit = self.grayscale_table.cellWidget(row, 4)
+            value_b_edit = self.grayscale_table.cellWidget(row, 5)
+            color_edit = self.grayscale_table.cellWidget(row, 6)
 
             rules.append(
                 GrayscaleMaskRule(
                     enabled=(use_combo.currentText() == "Yes"),
                     source_name=source_combo.currentText().strip(),
-                    condition=condition_combo.currentText().strip(),
+                    target_output_name=target_combo.currentText().strip(),
+                    condition=normalize_grayscale_condition(condition_combo.currentText().strip()),
                     value_a=value_a_edit.text().strip(),
                     value_b=value_b_edit.text().strip(),
                     color=color_edit.text().strip(),
@@ -2000,6 +2109,7 @@ class MaskingSettingsPage(QWizardPage):
             GrayscaleMaskRule(
                 enabled=True,
                 source_name=source_default,
+                target_output_name="All outputs",
                 condition="below",
                 value_a="",
                 value_b="",
@@ -2027,16 +2137,18 @@ class MaskingSettingsPage(QWizardPage):
         method_enabled = self.grayscale_enable_combo.currentText() == "Yes"
         use_combo = self.grayscale_table.cellWidget(row, 0)
         source_combo = self.grayscale_table.cellWidget(row, 1)
-        condition_combo = self.grayscale_table.cellWidget(row, 2)
-        value_a_edit = self.grayscale_table.cellWidget(row, 3)
-        value_b_edit = self.grayscale_table.cellWidget(row, 4)
-        color_edit = self.grayscale_table.cellWidget(row, 5)
+        target_combo = self.grayscale_table.cellWidget(row, 2)
+        condition_combo = self.grayscale_table.cellWidget(row, 3)
+        value_a_edit = self.grayscale_table.cellWidget(row, 4)
+        value_b_edit = self.grayscale_table.cellWidget(row, 5)
+        color_edit = self.grayscale_table.cellWidget(row, 6)
 
         rule_enabled = method_enabled and use_combo.currentText() == "Yes"
         needs_two_values = condition_combo.currentText() in ("between", "outside")
 
         use_combo.setEnabled(method_enabled)
         source_combo.setEnabled(rule_enabled)
+        target_combo.setEnabled(rule_enabled)
         condition_combo.setEnabled(rule_enabled)
         value_a_edit.setEnabled(rule_enabled)
         value_b_edit.setEnabled(rule_enabled and needs_two_values)
@@ -2060,7 +2172,7 @@ class MaskingSettingsPage(QWizardPage):
             rule = ConditionalReplacementRule(
                 enabled=True,
                 condition_source_name=source_default,
-                condition_operator=">",
+                condition_operator="above",
                 value_a="",
                 value_b="",
                 target_name=target_default,
@@ -2085,8 +2197,8 @@ class MaskingSettingsPage(QWizardPage):
         self.conditional_table.setCellWidget(row, 1, source_combo)
 
         operator_combo = QComboBox()
-        operator_combo.addItems([">", ">=", "<", "<=", "between"])
-        operator_combo.setCurrentText(rule.condition_operator or ">")
+        operator_combo.addItems(CONDITIONAL_OPERATORS)
+        operator_combo.setCurrentText(normalize_conditional_operator(rule.condition_operator) or "above")
         operator_combo.currentTextChanged.connect(lambda _text, r=row: self.update_conditional_row_state(r))
         self.conditional_table.setCellWidget(row, 2, operator_combo)
 
@@ -2127,7 +2239,7 @@ class MaskingSettingsPage(QWizardPage):
                 ConditionalReplacementRule(
                     enabled=(use_combo.currentText() == "Yes"),
                     condition_source_name=source_combo.currentText().strip(),
-                    condition_operator=operator_combo.currentText().strip(),
+                    condition_operator=normalize_conditional_operator(operator_combo.currentText().strip()),
                     value_a=value_a_edit.text().strip(),
                     value_b=value_b_edit.text().strip(),
                     target_name=target_combo.currentText().strip(),
@@ -2147,7 +2259,7 @@ class MaskingSettingsPage(QWizardPage):
             ConditionalReplacementRule(
                 enabled=True,
                 condition_source_name=source_default,
-                condition_operator=">",
+                condition_operator="above",
                 value_a="",
                 value_b="",
                 target_name=target_default,
@@ -2245,9 +2357,29 @@ class MaskingSettingsPage(QWizardPage):
                 )
                 return False
 
+            available_targets = set(self.state.get_output_names()) | {"All outputs"}
+
             for idx, rule in enumerate(active_grayscale_rules, start=1):
+                condition = normalize_grayscale_condition(rule.condition)
+
                 if rule.source_name.strip() == "":
                     QMessageBox.warning(self, "Missing grayscale source", f"Grayscale rule {idx}: please choose the source file.")
+                    return False
+
+                if rule.target_output_name.strip() == "":
+                    QMessageBox.warning(
+                        self,
+                        "Missing target output",
+                        f"Grayscale rule {idx}: please choose which output this mask should apply to."
+                    )
+                    return False
+
+                if rule.target_output_name.strip() not in available_targets:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid target output",
+                        f"Grayscale rule {idx}: target output '{rule.target_output_name}' is not available."
+                    )
                     return False
 
                 if rule.color.strip() == "":
@@ -2262,7 +2394,7 @@ class MaskingSettingsPage(QWizardPage):
                     )
                     return False
 
-                if rule.condition in ("below", "above"):
+                if condition in ("below", "above"):
                     if rule.value_a.strip() == "":
                         QMessageBox.warning(self, "Missing threshold", f"Grayscale rule {idx}: please enter Value A.")
                         return False
@@ -2272,12 +2404,12 @@ class MaskingSettingsPage(QWizardPage):
                         QMessageBox.warning(self, "Invalid threshold", f"Grayscale rule {idx}: Value A must be a number.")
                         return False
 
-                elif rule.condition in ("between", "outside"):
+                elif condition in ("between", "outside"):
                     if rule.value_a.strip() == "" or rule.value_b.strip() == "":
                         QMessageBox.warning(
                             self,
                             "Missing range values",
-                            f"Grayscale rule {idx}: '{rule.condition}' requires both Value A and Value B."
+                            f"Grayscale rule {idx}: '{condition}' requires both Value A and Value B."
                         )
                         return False
                     try:
@@ -2290,6 +2422,13 @@ class MaskingSettingsPage(QWizardPage):
                             f"Grayscale rule {idx}: Value A and Value B must be numbers."
                         )
                         return False
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid grayscale condition",
+                        f"Grayscale rule {idx}: '{rule.condition}' is not a valid condition."
+                    )
+                    return False
 
         if low_value_enabled:
             any_row_enabled = False
@@ -2334,6 +2473,8 @@ class MaskingSettingsPage(QWizardPage):
                 return False
 
             for idx, rule in enumerate(enabled_rules, start=1):
+                operator = normalize_conditional_operator(rule.condition_operator)
+
                 if rule.condition_source_name.strip() == "":
                     QMessageBox.warning(self, "Missing source file", f"Rule {idx}: please choose the source file.")
                     return False
@@ -2349,7 +2490,7 @@ class MaskingSettingsPage(QWizardPage):
                     QMessageBox.warning(self, "Invalid replacement value", f"Rule {idx}: replacement value must be a number.")
                     return False
 
-                if rule.condition_operator == "between":
+                if operator == "between":
                     if rule.value_a.strip() == "" or rule.value_b.strip() == "":
                         QMessageBox.warning(self, "Missing condition values", f"Rule {idx}: 'between' requires both Value A and Value B.")
                         return False
@@ -2359,7 +2500,7 @@ class MaskingSettingsPage(QWizardPage):
                     except ValueError:
                         QMessageBox.warning(self, "Invalid condition values", f"Rule {idx}: Value A and Value B must be numbers.")
                         return False
-                else:
+                elif operator in ("above", "below"):
                     if rule.value_a.strip() == "":
                         QMessageBox.warning(self, "Missing condition value", f"Rule {idx}: please enter Value A.")
                         return False
@@ -2368,6 +2509,13 @@ class MaskingSettingsPage(QWizardPage):
                     except ValueError:
                         QMessageBox.warning(self, "Invalid condition value", f"Rule {idx}: Value A must be a number.")
                         return False
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid condition",
+                        f"Rule {idx}: '{rule.condition_operator}' is not a valid condition."
+                    )
+                    return False
 
         settings.enabled = True
         settings.grayscale_enabled = grayscale_enabled
@@ -2992,6 +3140,9 @@ class ElementtiWizard(QWizard):
 
 
 app = QApplication(sys.argv)
+app.setWindowIcon(QIcon("AppIcon_tight.ico"))
+
 wizard = ElementtiWizard()
+wizard.setWindowIcon(QIcon("AppIcon_tight.ico"))
 wizard.show()
 sys.exit(app.exec())
