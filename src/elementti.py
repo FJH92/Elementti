@@ -5,14 +5,14 @@ import csv
 import json
 import re
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")
-matplotlib.rcParams["font.family"] = "Arial"
+matplotlib.rcParams["font.family"] = ["Arial", "DejaVu Sans", "sans-serif"]
 import matplotlib.pyplot as plt
 from matplotlib.colors import (
     is_color_like,
@@ -49,17 +49,26 @@ from PySide6.QtWidgets import (
 )
 
 
+APP_NAME = "Elementti"
+APP_VERSION = "1.0.0"
+DEFAULT_SAMPLE_SEED = 42
+
 APP_DEVELOPER_TEXT = (
     "Elementti was developed by the Laboratory of High Temperature Processes and Materials "
     "at Åbo Akademi University, Finland."
 )
 
 APP_CITATION_TEXT = (
-    "If you use Elementti in your work, please cite: "
-    "Jafarihonar, F. and Vainio, E. Elementti,:" 
-    "A Python-based GUI for processing and visualization of SEM-EDS elemental maps," 
-    "(manuscript in preparation)"
+    "If you use Elementti in your work, please cite the associated article."
 )
+
+
+def resource_path(filename: str) -> str:
+    if getattr(sys, "frozen", False):
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, filename)
 
 
 def suggest_name(file_name: str, used_names: set) -> str:
@@ -212,15 +221,18 @@ def parse_manual_index_list(text: str, what: str) -> List[int]:
     return sorted(set(result))
 
 
-def create_sample_data_files(folder: str) -> List[str]:
+def create_sample_data_files(folder: str, seed: Optional[int] = DEFAULT_SAMPLE_SEED) -> Tuple[List[str], int]:
     rows = 384
     cols = 512
+
+    if seed is None:
+        seed = int(np.random.SeedSequence().entropy)
 
     y = np.linspace(-1.0, 1.0, rows)
     x = np.linspace(-1.0, 1.0, cols)
     X, Y = np.meshgrid(x, y)
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
 
     grayscale = (
         110
@@ -260,6 +272,8 @@ def create_sample_data_files(folder: str) -> List[str]:
     )
     element2 = np.clip(element2 * 100.0, 0.05, None)
 
+    os.makedirs(folder, exist_ok=True)
+
     grayscale_path = os.path.join(folder, "grayscale_demo.csv")
     element1_path = os.path.join(folder, "element1_demo.csv")
     element2_path = os.path.join(folder, "element2_demo.csv")
@@ -268,7 +282,7 @@ def create_sample_data_files(folder: str) -> List[str]:
     np.savetxt(element1_path, element1, delimiter=",", fmt="%.6f")
     np.savetxt(element2_path, element2, delimiter=",", fmt="%.6f")
 
-    return [grayscale_path, element1_path, element2_path]
+    return [grayscale_path, element1_path, element2_path], seed
 
 
 @dataclass
@@ -321,13 +335,10 @@ class ConditionalReplacementRule:
 @dataclass
 class MaskingAndNoiseSettings:
     enabled: bool = False
-
     grayscale_enabled: bool = False
     grayscale_rules: List[GrayscaleMaskRule] = field(default_factory=list)
-
     low_value_enabled: bool = False
     low_value_by_name: Dict[str, LowValueRule] = field(default_factory=dict)
-
     conditional_enabled: bool = False
     conditional_rules: List[ConditionalReplacementRule] = field(default_factory=list)
 
@@ -349,6 +360,8 @@ class AppState:
     figure_format: str = "png"
     figure_dpi: int = 300
     sample_data_folder: str = ""
+    sample_data_mode: str = ""
+    sample_data_seed: Optional[int] = None
 
     def get_ordered_names(self) -> List[str]:
         return [
@@ -368,6 +381,36 @@ class AppState:
         outputs = list(self.selected_maps)
         outputs.extend(f"{num} / {den}" for num, den in self.selected_ratios)
         return outputs
+
+    def reset_outputs_and_display(self) -> None:
+        self.selected_maps = []
+        self.selected_ratios = []
+        self.display_settings.clear()
+        self.processed_min_max_by_name.clear()
+
+    def reset_masking_settings(self) -> None:
+        self.masking_and_noise_settings = MaskingAndNoiseSettings()
+
+    def reset_all_dependent_settings(self) -> None:
+        self.reset_outputs_and_display()
+        self.reset_masking_settings()
+
+    def clear_display_results_only(self) -> None:
+        self.display_settings.clear()
+        self.processed_min_max_by_name.clear()
+
+    def prune_display_settings_to_current_outputs(self) -> None:
+        allowed = set(self.get_output_names())
+        self.display_settings = {
+            name: settings
+            for name, settings in self.display_settings.items()
+            if name in allowed
+        }
+        self.processed_min_max_by_name = {
+            name: minmax
+            for name, minmax in self.processed_min_max_by_name.items()
+            if name in allowed
+        }
 
 
 class ProcessingEngine:
@@ -678,9 +721,7 @@ class ProcessingEngine:
     @staticmethod
     def get_visible_finite_values(array: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         if mask is not None and mask.shape != array.shape:
-            raise ValueError(
-                f"Mask shape {mask.shape} does not match data shape {array.shape}."
-            )
+            raise ValueError(f"Mask shape {mask.shape} does not match data shape {array.shape}.")
 
         visible = array if mask is None else array[~mask]
         return visible[np.isfinite(visible)]
@@ -810,11 +851,7 @@ class ProcessingEngine:
             overlay[rule_mask] = to_rgba(rule_color)
             ax.imshow(overlay, interpolation="nearest")
 
-        
-        cbar.set_label(
-            settings.colorbar_label.strip() or output_name,
-            fontname="Arial"
-        )
+        cbar.set_label(settings.colorbar_label.strip() or output_name, fontname="Arial")
 
         for tick in cbar.ax.get_yticklabels():
             tick.set_fontname("Arial")
@@ -892,8 +929,14 @@ class ProcessingEngine:
             }
 
         return {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
             "developer": APP_DEVELOPER_TEXT,
             "citation": APP_CITATION_TEXT,
+            "sample_data": {
+                "mode": self.state.sample_data_mode or None,
+                "seed": self.state.sample_data_seed,
+            },
             "renamed_files": renamed_files,
             "selected_maps": self.state.selected_maps,
             "selected_ratios": [
@@ -928,12 +971,21 @@ class ProcessingEngine:
     def build_methods_text(self) -> str:
         lines = []
 
-        lines.append("Elementti methods summary")
+        lines.append(f"{APP_NAME} methods summary")
         lines.append("")
+        lines.append(f"Version: {APP_VERSION}")
         lines.append(APP_DEVELOPER_TEXT)
         lines.append("")
         lines.append("Citation:")
         lines.append(APP_CITATION_TEXT)
+        lines.append("")
+
+        lines.append("Sample data:")
+        if self.state.sample_data_mode:
+            lines.append(f"- Mode: {self.state.sample_data_mode}")
+            lines.append(f"- Seed: {self.state.sample_data_seed}")
+        else:
+            lines.append("- Not used")
         lines.append("")
 
         lines.append("Input files:")
@@ -1152,9 +1204,9 @@ class ProcessingEngine:
 class WelcomePage(QWizardPage):
     def __init__(self):
         super().__init__()
-        self.setTitle("Welcome to Elementti")
+        self.setTitle(f"Welcome to {APP_NAME}")
         self.setSubTitle(
-            "A software for processing and visualization of SEM-EDS elemental maps.<br>"
+            f"Version {APP_VERSION}. A software for processing and visualization of SEM-EDS elemental maps.<br>"
             "Elementti is developed by the Laboratory of High Temperature Processes and Materials at "
             "Åbo Akademi University, Finland."
         )
@@ -1164,14 +1216,15 @@ class WelcomePage(QWizardPage):
         self.logo_label = QLabel()
         self.logo_label.setAlignment(Qt.AlignCenter)
 
-        icon_path = "App icon.png"
+        icon_path = resource_path("App icon.png")
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path)
             self.logo_label.setPixmap(
                 pixmap.scaled(
-                    840, 840,
+                    840,
+                    840,
                     Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
+                    Qt.SmoothTransformation,
                 )
             )
 
@@ -1199,24 +1252,27 @@ class UploadPage(QWizardPage):
             "- Click 'Choose CSV files'\n"
             "- Select one or many CSV files at once\n"
             "- You can click the button again if you want to add more files\n"
-            "- Or click 'Try with sample data' to load three demo CSV files"
+            "- Or load built-in demo CSV files using either reproducible or random sample data"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
         row = QHBoxLayout()
         self.choose_button = QPushButton("Choose CSV files")
-        self.sample_button = QPushButton("Try with sample data")
+        self.repro_sample_button = QPushButton("Load reproducible sample data")
+        self.random_sample_button = QPushButton("Load random sample data")
         self.remove_button = QPushButton("Remove selected file")
         self.clear_button = QPushButton("Clear all")
 
         self.choose_button.clicked.connect(self.choose_files)
-        self.sample_button.clicked.connect(self.load_sample_data)
+        self.repro_sample_button.clicked.connect(self.load_reproducible_sample_data)
+        self.random_sample_button.clicked.connect(self.load_random_sample_data)
         self.remove_button.clicked.connect(self.remove_selected_file)
         self.clear_button.clicked.connect(self.clear_all_files)
 
         row.addWidget(self.choose_button)
-        row.addWidget(self.sample_button)
+        row.addWidget(self.repro_sample_button)
+        row.addWidget(self.random_sample_button)
         row.addWidget(self.remove_button)
         row.addWidget(self.clear_button)
         row.addStretch()
@@ -1254,7 +1310,7 @@ class UploadPage(QWizardPage):
             self,
             "Choose one or more CSV files",
             "",
-            "CSV Files (*.csv);;All Files (*)"
+            "CSV Files (*.csv);;All Files (*)",
         )
         if not file_names:
             return
@@ -1265,33 +1321,52 @@ class UploadPage(QWizardPage):
                 self.state.selected_file_paths.append(path)
                 added += 1
 
+        if added > 0:
+            self.state.sample_data_mode = ""
+            self.state.sample_data_seed = None
+            self.state.reset_all_dependent_settings()
+
         self.refresh_list()
         self.status_label.setText(
             f"{added} new file(s) added. Click Next when you are done."
-            if added > 0 else "Those files were already added."
+            if added > 0
+            else "Those files were already added."
         )
         self.completeChanged.emit()
 
-    def load_sample_data(self):
+    def load_reproducible_sample_data(self):
+        self._load_sample_data(sample_mode="reproducible", sample_seed=DEFAULT_SAMPLE_SEED)
+
+    def load_random_sample_data(self):
+        self._load_sample_data(sample_mode="random", sample_seed=None)
+
+    def _load_sample_data(self, sample_mode: str, sample_seed: Optional[int]):
         try:
             if not self.state.sample_data_folder or not os.path.isdir(self.state.sample_data_folder):
                 self.state.sample_data_folder = tempfile.mkdtemp(prefix="elementti_demo_")
 
-            sample_paths = create_sample_data_files(self.state.sample_data_folder)
+            sample_folder_name = (
+                f"reproducible_seed_{sample_seed}"
+                if sample_mode == "reproducible"
+                else "random"
+            )
+            sample_folder = os.path.join(self.state.sample_data_folder, sample_folder_name)
 
-            added = 0
-            for path in sample_paths:
-                if path not in self.state.selected_file_paths:
-                    self.state.selected_file_paths.append(path)
-                    added += 1
+            sample_paths, used_seed = create_sample_data_files(sample_folder, seed=sample_seed)
 
+            self.state.selected_file_paths = list(sample_paths)
+            self.state.renamed_names_by_path = {}
+            self.state.file_processing_settings = {}
+            self.state.sample_data_mode = sample_mode
+            self.state.sample_data_seed = used_seed
+            self.state.reset_all_dependent_settings()
+
+            mode_text = "reproducible" if sample_mode == "reproducible" else "random"
             self.refresh_list()
             self.status_label.setText(
-                f"{added} sample file(s) added. "
-                f"The demo data include grayscale_demo.csv, element1_demo.csv, and element2_demo.csv "
-                f"(384 rows × 512 columns)."
-                if added > 0 else
-                "Sample data were already added."
+                f"{len(sample_paths)} sample file(s) loaded using {mode_text} demo data "
+                f"(seed={used_seed}). The demo data include grayscale_demo.csv, "
+                f"element1_demo.csv, and element2_demo.csv (384 rows × 512 columns)."
             )
             self.completeChanged.emit()
 
@@ -1299,7 +1374,7 @@ class UploadPage(QWizardPage):
             QMessageBox.warning(
                 self,
                 "Could not create sample data",
-                f"The app could not create the sample CSV files.\n\n{str(e)}"
+                f"The app could not create the sample CSV files.\n\n{str(e)}",
             )
 
     def remove_selected_file(self):
@@ -1316,6 +1391,11 @@ class UploadPage(QWizardPage):
 
         self.state.renamed_names_by_path.pop(path, None)
         self.state.file_processing_settings.pop(path, None)
+        self.state.reset_all_dependent_settings()
+
+        if not self.state.selected_file_paths:
+            self.state.sample_data_mode = ""
+            self.state.sample_data_seed = None
 
         self.refresh_list()
         self.status_label.setText("One file was removed.")
@@ -1329,13 +1409,16 @@ class UploadPage(QWizardPage):
             self,
             "Clear all files",
             "Remove all uploaded files?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No,
         )
 
         if reply == QMessageBox.Yes:
             self.state.selected_file_paths.clear()
             self.state.renamed_names_by_path.clear()
             self.state.file_processing_settings.clear()
+            self.state.sample_data_mode = ""
+            self.state.sample_data_seed = None
+            self.state.reset_all_dependent_settings()
             self.refresh_list()
             self.status_label.setText("All uploaded files were cleared.")
             self.completeChanged.emit()
@@ -1448,11 +1531,17 @@ class RenamePage(QWizardPage):
             names.append(chosen_name)
             result[path] = chosen_name
 
+        old_names_by_path = dict(self.state.renamed_names_by_path)
+
         if len(names) != len(set(names)):
             QMessageBox.warning(self, "Duplicate names", "Each chosen name must be unique.")
             return False
 
         self.state.renamed_names_by_path = result
+
+        if old_names_by_path != result:
+            self.state.reset_all_dependent_settings()
+
         self.status_label.setText("Renaming finished successfully.")
         return True
 
@@ -1597,6 +1686,8 @@ class OutputsPage(QWizardPage):
         if not self.state.selected_maps and not self.state.selected_ratios:
             QMessageBox.warning(self, "Nothing selected", "Please choose at least one map or one ratio.")
             return False
+
+        self.state.prune_display_settings_to_current_outputs()
         return True
 
     def update_status(self):
@@ -1737,7 +1828,20 @@ class ProcessingSettingsPage(QWizardPage):
                 scale_factor=scale_text,
             )
 
+        old_settings = {
+            path: asdict(settings)
+            for path, settings in self.state.file_processing_settings.items()
+        }
+        new_settings = {
+            path: asdict(settings)
+            for path, settings in result.items()
+        }
+
         self.state.file_processing_settings = result
+
+        if old_settings != new_settings:
+            self.state.clear_display_results_only()
+
         return True
 
 
@@ -2626,26 +2730,19 @@ class DisplaySettingsPage(QWizardPage):
         return "viridis"
 
     def ensure_default_display_settings_exist(self):
-        stats = self.state.processed_min_max_by_name
+        self.state.prune_display_settings_to_current_outputs()
+
         for output_name in self.get_output_names():
             if output_name in self.state.display_settings:
                 continue
-
-            min_text = ""
-            max_text = ""
-            if output_name in stats:
-                min_val, max_val = stats[output_name]
-                if min_val is not None and max_val is not None:
-                    min_text = f"{min_val:g}"
-                    max_text = f"{max_val:g}"
 
             self.state.display_settings[output_name] = OutputDisplaySettings(
                 mode="Continuous",
                 colormap=self.default_colormap_for_output(output_name),
                 colorbar_side="right",
                 colorbar_label=default_colorbar_label(output_name),
-                display_min=min_text,
-                display_max=max_text,
+                display_min="",
+                display_max="",
             )
 
     def populate_table(self):
@@ -2806,6 +2903,15 @@ class DisplaySettingsPage(QWizardPage):
         return True
 
     def validatePage(self):
+        output_names = self.get_output_names()
+        if output_names and self.table.rowCount() == 0:
+            QMessageBox.warning(
+                self,
+                "Display settings unavailable",
+                "The display table is empty because the current files or processing settings could not be read."
+            )
+            return False
+
         result: Dict[str, OutputDisplaySettings] = {}
 
         for row in range(self.table.rowCount()):
@@ -2918,7 +3024,7 @@ class GeneratePage(QWizardPage):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
-        self.citation_title_label = QLabel("Citation:")
+        self.citation_title_label = QLabel(f"Citation for {APP_NAME} {APP_VERSION}:")
         layout.addWidget(self.citation_title_label)
 
         self.citation_label = QLabel(APP_CITATION_TEXT)
@@ -2985,7 +3091,7 @@ class GeneratePage(QWizardPage):
         folder = QFileDialog.getExistingDirectory(
             self,
             "Choose output folder",
-            self.output_folder_edit.text().strip() or ""
+            self.output_folder_edit.text().strip() or "",
         )
         if folder:
             self.output_folder_edit.setText(folder)
@@ -3000,25 +3106,38 @@ class GeneratePage(QWizardPage):
             QMessageBox.warning(self, "Missing output folder", "Please choose an output folder.")
             return False
 
-        dpi_text = self.dpi_edit.text().strip()
-        if dpi_text == "":
-            QMessageBox.warning(self, "Missing DPI", "Please enter a DPI value.")
+        if not self.state.save_png and not self.state.save_csv:
+            QMessageBox.warning(
+                self,
+                "Nothing to save",
+                "Please select at least one output type: figure files and/or processed CSV files."
+            )
             return False
 
-        try:
-            dpi_value = int(dpi_text)
-            if dpi_value <= 0:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "Invalid DPI", "DPI must be a whole number greater than 0.")
-            return False
+        if self.state.save_png:
+            dpi_text = self.dpi_edit.text().strip()
+            if dpi_text == "":
+                QMessageBox.warning(self, "Missing DPI", "Please enter a DPI value.")
+                return False
 
-        self.state.figure_dpi = dpi_value
+            try:
+                dpi_value = int(dpi_text)
+                if dpi_value <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.warning(self, "Invalid DPI", "DPI must be a whole number greater than 0.")
+                return False
+
+            self.state.figure_dpi = dpi_value
 
         try:
             os.makedirs(self.state.output_folder, exist_ok=True)
         except Exception as e:
-            QMessageBox.warning(self, "Cannot create folder", f"The app could not create or access the output folder.\n\n{str(e)}")
+            QMessageBox.warning(
+                self,
+                "Cannot create output folder",
+                f"The app could not create or access the output folder.\n\n{str(e)}"
+            )
             return False
 
         return True
@@ -3061,7 +3180,7 @@ class ElementtiWizard(QWizard):
         self.state = AppState()
         self.engine = ProcessingEngine(self.state)
 
-        self.setWindowTitle("Elementti")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setWizardStyle(QWizard.ModernStyle)
 
         self.setWindowFlags(
@@ -3139,10 +3258,19 @@ class ElementtiWizard(QWizard):
             )
 
 
-app = QApplication(sys.argv)
-app.setWindowIcon(QIcon("AppIcon_tight.ico"))
+def main():
+    app = QApplication(sys.argv)
 
-wizard = ElementtiWizard()
-wizard.setWindowIcon(QIcon("AppIcon_tight.ico"))
-wizard.show()
-sys.exit(app.exec())
+    icon_path = resource_path("AppIcon_tight.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+    wizard = ElementtiWizard()
+    if os.path.exists(icon_path):
+        wizard.setWindowIcon(QIcon(icon_path))
+    wizard.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
