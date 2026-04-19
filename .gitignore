@@ -1,12 +1,42 @@
+# Python cache and compiled files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging outputs
+build/
+dist/
+*.spec
+
+# Installer and packaging leftovers
+pip-wheel-metadata/
+
+# Logs and temporary files
 *.log
 *.tmp
 *.bak
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# OS files
 .DS_Store
 Thumbs.db
-dist/
-build/
-*.spec
+
+# App runtime outputs
+output/
+*.json
+methods_Elementti.txt
