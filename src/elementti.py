@@ -84,7 +84,11 @@ APP_DEVELOPER_TEXT = (
 )
 
 APP_CITATION_TEXT = (
-    "If you use Elementti in your work, please cite the associated article."
+    "If you use Elementti, please cite: "
+    "Jafarihonar, F., & Vainio, E. (2026). "
+    "Elementti: A Python-based desktop GUI application for processing and visualization "
+    "of SEM-EDS elemental maps. SoftwareX, 35, 102826. "
+    "https://doi.org/10.1016/j.softx.2026.102826"
 )
 
 
@@ -6822,11 +6826,16 @@ class GeneratePage(QWizardPage):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
-        self.citation_title_label = QLabel(f"Citation for {APP_NAME} {APP_VERSION}:")
+        self.citation_title_label = QLabel(f"Citation for {APP_NAME}:")
+        self.citation_title_label.setStyleSheet("font-weight: bold;")
+        self.citation_title_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.citation_title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout.addWidget(self.citation_title_label)
 
         self.citation_label = QLabel(APP_CITATION_TEXT)
         self.citation_label.setWordWrap(True)
+        self.citation_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.citation_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.citation_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.citation_label)
 
