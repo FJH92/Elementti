@@ -1,0 +1,69 @@
+# Changelog
+
+## v1.0.8
+
+Post-publication update of Elementti.
+
+### Changed
+
+* Simplified demo loading to one **Load demo data** option.
+* Demo data are fixed and repeatable by default.
+* Demo CSV files include metadata rows and detectable pixel-size information.
+* Improved demo temporary-folder handling and cleanup.
+* Updated icon and welcome-image resource names to `icoElementti_1_0_8.ico` and `pngElementti_1_0_8.png`.
+* Improved Windows app icon handling for EXE/taskbar use.
+* Removed unused old preview code.
+
+### Fixed
+
+* Added safer export filenames to prevent accidental overwriting.
+
+## v1.0.7
+
+* Made line-length labels draw above the red arrow.
+* Improved automatic guide-bar endpoint rounding, for example `1.78378` becomes `1.8`.
+* Made line-profile legends draw above curves for better readability.
+
+## v1.0.6
+
+* Reduced guide-bar and y-axis label clutter near clipped endpoint labels.
+* Added line-profile legend placement option: **Inside plot** or **Outside right**.
+
+## v1.0.5
+
+* Added clearer display min/max guide-bar labels such as `≥21` and `≤0`.
+* Line-profile x-axis now uses physical distance when pixel size is available.
+* Added dual y-axes for mixed element and ratio profiles.
+* Added optional manual y-axis limits for line profiles.
+
+## v1.0.4
+
+* Simplified the formula-map interface.
+* Moved formula examples into **Read instructions**.
+* Changed line-profile end marker to an arrow to show direction.
+
+## v1.0.3
+
+* Added custom formula maps.
+* Supports expressions such as `X + Y / Z`, `(X + Y) / Z`, `X / (Y + Z)`, `sqrt(X)`, and `log10(X)`.
+* Input names with spaces or symbols can be written as `[Exact input name]` or `{Exact input name}`.
+* Added safe formula parsing and validation.
+
+## v1.0.2
+
+* Added unit-aware pixel-size handling.
+* Pixel size can be detected or entered in `nm`, `um/µm`, `mm`, `cm`, or `m`.
+* Values are converted internally to `µm/pixel`.
+
+## v1.0.1
+
+* Original baseline version.
+* Supports CSV map loading, map selection, simple ratios, display settings, masks, scale bars, line profiles, and export.
+
+## Notes
+
+* The SoftwareX-published version is **v1.0.0**.
+* The current updated post-publication version is **v1.0.8**.
+* Always check detected pixel size before final export.
+* Display min/max changes the color scale; it does not remove data.
+* Values above display max use the top color, and values below display min use the bottom color.
