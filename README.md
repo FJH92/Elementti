@@ -1,11 +1,12 @@
 # Elementti
 
-**Current version:** v1.0.8
+**Current version:** v1.0.9
 **SoftwareX published version:** v1.0.0
+**Latest version file:** `Elementti_1_0_9.py`
 
 Elementti is a Python-based desktop graphical user interface (GUI) for processing and visualization of SEM-EDS elemental maps exported in CSV format.
 
-The version associated with the published SoftwareX article is **Elementti v1.0.0**. That release is preserved for reproducibility. **Elementti v1.0.8** is the current updated post-publication version.
+The version associated with the published SoftwareX article is **Elementti v1.0.0**. That release is preserved for reproducibility. **Elementti v1.0.9** is the current updated post-publication version.
 
 ## Citation
 
@@ -31,9 +32,15 @@ Elementti was developed to support more consistent and reproducible post-process
 * apply conditional replacement rules
 * visualize outputs using continuous colormaps or manually defined bins
 * adjust display minimum and maximum values for color-scale control
+* round displayed data minimum and maximum values for readability
+* control colorbar tick-number size and colorbar label-text size per output
 * add scale bars when pixel-size information is available
 * create line profiles with optional physical-distance scaling
+* edit or clear the line-profile x-axis label
 * use dual y-axes for mixed element and ratio line profiles
+* set optional manual y-axis limits for line profiles
+* control line-profile tick size and text size for axis numbers, labels, title, legend, and map-panel labels
+* choose line-profile legend placement inside the plot or outside right
 * export processed CSV files and figure files
 * automatically save selected processing and visualization settings in a JSON summary file
 * generate a plain-text methods file for record keeping and reproducibility
@@ -41,7 +48,7 @@ Elementti was developed to support more consistent and reproducible post-process
 
 ## Repository contents
 
-* `src/elementti.py` – main source code
+* `Elementti_1_0_9.py` – latest source file
 * `sample_data/` – example CSV files for demonstration
 * `requirements.txt` – required Python packages
 * `LICENSE` – software license
@@ -76,13 +83,13 @@ py -m pip install numpy matplotlib PySide6
 Run the program with:
 
 ```bash
-python src/elementti.py
+python Elementti_1_0_9.py
 ```
 
 On Windows, this may also be run with:
 
 ```bash
-py src/elementti.py
+py Elementti_1_0_9.py
 ```
 
 ## Windows executable
@@ -95,7 +102,7 @@ Use the GitHub Releases page to download the executable for the latest version w
 
 Elementti includes built-in demo data for testing and demonstration.
 
-In v1.0.8, the demo data are fixed and repeatable by default. The generated demo CSV files include metadata rows and detectable pixel-size information.
+Since v1.0.8, the demo data are fixed and repeatable by default. The generated demo CSV files include metadata rows and detectable pixel-size information.
 
 Always check the detected pixel size before final export.
 
@@ -110,7 +117,8 @@ A typical workflow in Elementti consists of the following steps:
 5. optionally apply masking and rule-based processing
 6. choose visualization settings
 7. optionally define scale bars or line profiles
-8. export processed data and figure files
+8. adjust colorbar, tick-size, text-size, and line-profile labeling settings as needed
+9. export processed data and figure files
 
 ## Output files
 
@@ -118,7 +126,7 @@ Depending on the selected options, Elementti can export:
 
 * processed CSV files
 * figure files
-* a JSON summary file containing selected processing and visualization settings
+* a JSON summary file containing selected processing, visualization, size, label, and line-profile settings
 * a plain-text methods file summarizing the workflow
 
 ## Notes on visualization
@@ -127,9 +135,11 @@ Display minimum and maximum values change the color scale; they do not remove da
 
 Values above the display maximum use the top color, and values below the display minimum use the bottom color.
 
-## Main changes in v1.0.8
+Data min and Data max are displayed rounded to at most four decimals. Disp min and Disp max accept values with at most four decimals.
 
-Elementti v1.0.8 is a post-publication update. Main updates since the original release include:
+## Main changes in v1.0.9
+
+Elementti v1.0.9 is a post-publication update. Main updates since the original release include:
 
 * unit-aware pixel-size handling
 * custom formula maps
@@ -143,7 +153,17 @@ Elementti v1.0.8 is a post-publication update. Main updates since the original r
 * fixed and repeatable demo data
 * safer export filenames to prevent accidental overwriting
 * improved Windows executable icon handling
-* removal of unused old preview code
+* updated in-app citation to the published SoftwareX reference
+* clickable DOI shown on its own line in the in-app citation
+* per-output Tick size and Text size controls for colorbar numbers and labels
+* matching Tick size and Text size controls for line-profile plots and map-panel labels
+* editable line-profile x-axis label, with clearing supported
+* shorter display-settings column headers for readability
+* rounded Data min and Data max display values
+* four-decimal input limit for Disp min and Disp max
+* more compact display-settings columns to preserve width for Bins and Bin colors
+* recording of new size, label, and x-axis-label settings in the JSON summary and methods text
+* updated icon and welcome-image resource names to `icoElementti_1_0_9.ico` and `pngElementti_1_0_9.png`, with older resource names still supported as fallbacks
 
 ## Intended use
 
@@ -159,7 +179,7 @@ This repository contains the Elementti software associated with the SoftwareX ar
 
 Version **v1.0.0** corresponds to the published SoftwareX version and is preserved for reproducibility.
 
-Version **v1.0.8** is the current updated post-publication version and includes corrections, usability improvements, and additional functionality.
+Version **v1.0.9** is the current updated post-publication version and includes corrections, usability improvements, additional functionality, updated citation handling, expanded size and label controls, and improved export traceability.
 
 ## Author
 
