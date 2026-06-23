@@ -43,8 +43,8 @@ from matplotlib.colors import (
 )
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap, QIcon
+from PySide6.QtCore import Qt, QTimer, QUrl, QRegularExpression
+from PySide6.QtGui import QDesktopServices, QPixmap, QIcon, QIntValidator, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
     QWizard,
@@ -75,7 +75,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "Elementti"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 DEFAULT_SAMPLE_SEED = 42
 
 APP_DEVELOPER_TEXT = (
@@ -83,12 +83,27 @@ APP_DEVELOPER_TEXT = (
     "at Åbo Akademi University, Finland."
 )
 
+APP_PAPER_TITLE = (
+    "Elementti: A Python-Based Desktop GUI Application for Processing "
+    "and Visualization of SEM-EDS Elemental Maps"
+)
+
+# Plain-text citation used in the methods file and JSON summary.
 APP_CITATION_TEXT = (
-    "If you use Elementti, please cite: "
-    "Jafarihonar, F., & Vainio, E. (2026). "
-    "Elementti: A Python-based desktop GUI application for processing and visualization "
-    "of SEM-EDS elemental maps. SoftwareX, 35, 102826. "
-    "https://doi.org/10.1016/j.softx.2026.102826"
+    "Farzad Jafarihonar and Emil Vainio, "
+    f"“{APP_PAPER_TITLE},” "
+    "SoftwareX, 35, (2026): 102826,\n"
+    "https://doi.org/10.1016/j.softx.2026.102826."
+)
+
+# Rich-text (HTML) citation used for on-screen display, with the paper title in bold
+# and the DOI as a clickable link on its own line.
+APP_CITATION_HTML = (
+    "Farzad Jafarihonar and Emil Vainio, "
+    f"“<b>{APP_PAPER_TITLE}</b>,” "
+    "SoftwareX, 35, (2026): 102826,<br>"
+    '<a href="https://doi.org/10.1016/j.softx.2026.102826">'
+    "https://doi.org/10.1016/j.softx.2026.102826</a>."
 )
 
 
@@ -662,6 +677,74 @@ def format_plot_number(value: float) -> str:
     if abs(value - round(value)) < 1e-10:
         return str(int(round(value)))
     return f"{value:.6g}"
+
+
+# Selectable font sizes for tick numbers (colorbar numbers on maps, axis numbers
+# on line profiles). "Default" keeps Matplotlib's normal size; the numeric options
+# let the user make the numbers slightly bigger or smaller, separately per image.
+TICK_LABEL_SIZE_OPTIONS = [
+    "Default",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "14",
+    "16",
+    "18",
+    "20",
+]
+
+
+def parse_tick_label_size(value_text: str) -> Optional[float]:
+    """Return a positive font size in points, or None when the default size should be used."""
+    text = str(value_text).strip()
+    if text == "" or text.lower() == "default":
+        return None
+    try:
+        size = float(text)
+    except ValueError:
+        return None
+    if size > 0:
+        return size
+    return None
+
+
+# Default Matplotlib font size (points). The size fields show this number directly instead of
+# the word "Default", and accept whole numbers within the range below.
+DEFAULT_LABEL_FONT_SIZE = 10
+LABEL_FONT_SIZE_MIN = 8
+LABEL_FONT_SIZE_MAX = 20
+
+
+def normalize_label_font_size(value_text, default: int = DEFAULT_LABEL_FONT_SIZE) -> str:
+    """Return a whole-number font size (as text) clamped to the allowed range.
+
+    Anything that cannot be read as a number (including the legacy "Default") falls back to the
+    default size, so older saved settings keep working.
+    """
+    try:
+        size = int(round(float(str(value_text).strip())))
+    except (TypeError, ValueError):
+        return str(default)
+    size = max(LABEL_FONT_SIZE_MIN, min(LABEL_FONT_SIZE_MAX, size))
+    return str(size)
+
+
+def format_table_number_4dp(value) -> str:
+    """Format a value with at most 4 decimal places, trimming trailing zeros."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(num):
+        return ""
+    text = f"{round(num, 4):.4f}".rstrip("0").rstrip(".")
+    if text in ("", "-", "-0"):
+        return "0"
+    return text
 
 
 def decimal_places_for_tick_spacing(spacing: float, max_decimals: int = 6) -> int:
@@ -1549,6 +1632,10 @@ class OutputDisplaySettings:
     display_max: str = ""
     bins: str = ""
     bin_colors: str = ""
+    # Font size (in points) for the colorbar numbers; "Default" keeps Matplotlib's size.
+    tick_label_size: str = "Default"
+    # Font size (in points) for the colorbar text label; "Default" keeps Matplotlib's size.
+    text_label_size: str = "Default"
 
 
 @dataclass
@@ -1573,7 +1660,10 @@ class LineProfileSettings:
     image_y_label: str = ""
     title: str = ""
     # Blank x_label means automatic: physical distance if a pixel size is available, otherwise pixels.
+    # When x_label_is_custom is True, x_label is used exactly as typed, and an empty
+    # x_label means the line-profile x-axis shows no label at all.
     x_label: str = ""
+    x_label_is_custom: bool = False
     y_label: str = "Value"
     y_min: str = ""
     y_max: str = ""
@@ -1581,6 +1671,11 @@ class LineProfileSettings:
     right_y_min: str = ""
     right_y_max: str = ""
     legend_position: str = "Inside plot"
+    # Font size (in points) for the line-profile axis numbers; "Default" keeps Matplotlib's size.
+    tick_label_size: str = "Default"
+    # Font size (in points) for the line-profile text labels (axis labels, title, legend, and the
+    # map-panel labels); "Default" keeps Matplotlib's size.
+    text_label_size: str = "Default"
     curve_settings: Dict[str, LineProfileCurveSettings] = field(default_factory=dict)
 
 
@@ -2427,12 +2522,12 @@ class ProcessingEngine:
             for output_name in right_names:
                 plot_curve(right_ax, output_name)
 
-        auto_x_label = profile_data.get("distance_axis_label", "Distance along line (pixels)")
-        custom_x_label = settings.x_label.strip()
-        if custom_x_label and custom_x_label != "Distance along line (pixels)":
-            x_label = custom_x_label
+        if settings.x_label_is_custom:
+            # The label is used exactly as typed. An empty value means the
+            # line-profile x-axis intentionally shows no label at all.
+            x_label = settings.x_label
         else:
-            x_label = auto_x_label
+            x_label = profile_data.get("distance_axis_label", "Distance along line (pixels)")
         ax.set_xlabel(x_label, fontname=DEFAULT_FONT_NAME)
 
         custom_left_y_label = settings.y_label.strip()
@@ -2505,6 +2600,28 @@ class ProcessingEngine:
         ax.grid(True, alpha=0.25)
         if right_ax is not None:
             right_ax.grid(False)
+
+        tick_size = parse_tick_label_size(settings.tick_label_size)
+        if tick_size is not None:
+            for axis_obj in [ax, right_ax]:
+                if axis_obj is None:
+                    continue
+                axis_obj.tick_params(axis="both", labelsize=tick_size)
+                for tick_label in list(axis_obj.get_xticklabels()) + list(axis_obj.get_yticklabels()):
+                    tick_label.set_fontsize(tick_size)
+
+        text_size = parse_tick_label_size(settings.text_label_size)
+        if text_size is not None:
+            for axis_obj in [ax, right_ax]:
+                if axis_obj is None:
+                    continue
+                axis_obj.xaxis.label.set_fontsize(text_size)
+                axis_obj.yaxis.label.set_fontsize(text_size)
+                axis_obj.title.set_fontsize(text_size)
+                legend = axis_obj.get_legend()
+                if legend is not None:
+                    for legend_text in legend.get_texts():
+                        legend_text.set_fontsize(text_size)
 
     @staticmethod
     def format_scale_bar_number(value: float) -> str:
@@ -2926,8 +3043,16 @@ class ProcessingEngine:
         if cbar is not None:
             guide_label = (colorbar_label_override or "").strip() or settings.colorbar_label.strip() or output_name
             cbar.set_label(guide_label, fontname=DEFAULT_FONT_NAME)
+            text_size = parse_tick_label_size(settings.text_label_size)
+            if text_size is not None:
+                cbar.ax.yaxis.label.set_fontsize(text_size)
+            tick_size = parse_tick_label_size(settings.tick_label_size)
             for tick in cbar.ax.get_yticklabels():
                 tick.set_fontname(DEFAULT_FONT_NAME)
+                if tick_size is not None:
+                    tick.set_fontsize(tick_size)
+            if tick_size is not None:
+                cbar.ax.tick_params(axis="y", labelsize=tick_size)
             side_text = colorbar_side_override or settings.colorbar_side
             if str(side_text).strip().lower() == "left":
                 cbar.ax.yaxis.set_label_position("left")
@@ -3011,6 +3136,11 @@ class ProcessingEngine:
             ax_map.set_title(lp_settings.image_title.strip(), fontname=DEFAULT_FONT_NAME)
         if lp_settings.image_x_label.strip():
             ax_map.set_xlabel(lp_settings.image_x_label.strip(), fontname=DEFAULT_FONT_NAME)
+        lp_text_size = parse_tick_label_size(lp_settings.text_label_size)
+        if lp_text_size is not None:
+            ax_map.title.set_fontsize(lp_text_size)
+            ax_map.xaxis.label.set_fontsize(lp_text_size)
+            cax.yaxis.label.set_fontsize(lp_text_size)
 
         self.plot_line_profile_axis(
             ax_profile,
@@ -3166,6 +3296,8 @@ class ProcessingEngine:
                 "display_max": settings.display_max,
                 "bins": settings.bins,
                 "bin_colors": settings.bin_colors,
+                "colorbar_number_size": settings.tick_label_size,
+                "colorbar_text_size": settings.text_label_size,
             }
 
         lp = self.state.line_profile_settings
@@ -3181,6 +3313,7 @@ class ProcessingEngine:
             "image_guide_bar_label": lp.image_y_label,
             "title": lp.title,
             "x_label": lp.x_label,
+            "x_label_is_custom": lp.x_label_is_custom,
             "left_y_label": lp.y_label,
             "left_y_min": lp.y_min,
             "left_y_max": lp.y_max,
@@ -3188,6 +3321,8 @@ class ProcessingEngine:
             "right_y_min": lp.right_y_min,
             "right_y_max": lp.right_y_max,
             "legend_position": normalize_line_profile_legend_position(lp.legend_position),
+            "axis_number_size": lp.tick_label_size,
+            "text_label_size": lp.text_label_size,
             "curve_settings": {
                 name: {
                     "enabled": settings.enabled,
@@ -3373,8 +3508,10 @@ class ProcessingEngine:
                 lines.append(f"  Colormap: {settings.colormap}")
                 lines.append(f"  Guide bar side: {settings.colorbar_side}")
                 lines.append(f"  Guide bar label: {settings.colorbar_label}")
-                lines.append(f"  Display min: {settings.display_min if settings.display_min else 'Processed min'}")
-                lines.append(f"  Display max: {settings.display_max if settings.display_max else 'Processed max'}")
+                lines.append(f"  Display min: {settings.display_min if settings.display_min else 'Data min'}")
+                lines.append(f"  Display max: {settings.display_max if settings.display_max else 'Data max'}")
+                lines.append(f"  Colorbar number size: {settings.tick_label_size if settings.tick_label_size else 'Default'}")
+                lines.append(f"  Colorbar text size: {settings.text_label_size if settings.text_label_size else 'Default'}")
                 if settings.mode == "Manual bins":
                     lines.append(f"  Bins: {settings.bins}")
                     lines.append(f"  Bin colors: {settings.bin_colors}")
@@ -3404,12 +3541,18 @@ class ProcessingEngine:
             lines.append(f"- Image X-axis label: {lp.image_x_label if lp.image_x_label else 'None'}")
             lines.append(f"- Image guide-bar label: {lp.image_y_label if lp.image_y_label else 'None'}")
             lines.append(f"- Line-profile title: {lp.title if lp.title else 'None'}")
-            lines.append(f"- Line-profile X-axis label: {lp.x_label if lp.x_label else 'Automatic'}")
+            if lp.x_label_is_custom:
+                x_label_report = lp.x_label if lp.x_label else "None (no label shown)"
+            else:
+                x_label_report = "Automatic"
+            lines.append(f"- Line-profile X-axis label: {x_label_report}")
             lines.append(f"- Line-profile left Y-axis label: {lp.y_label if lp.y_label else 'Automatic'}")
             lines.append(f"- Line-profile left Y-axis range: {lp.y_min if lp.y_min else 'Automatic'} to {lp.y_max if lp.y_max else 'Automatic'}")
             lines.append(f"- Line-profile right Y-axis label: {lp.right_y_label if lp.right_y_label else 'Ratio value'}")
             lines.append(f"- Line-profile right Y-axis range: {lp.right_y_min if lp.right_y_min else 'Automatic'} to {lp.right_y_max if lp.right_y_max else 'Automatic'}")
             lines.append(f"- Line-profile legend position: {normalize_line_profile_legend_position(lp.legend_position)}")
+            lines.append(f"- Line-profile axis number size: {lp.tick_label_size if lp.tick_label_size else 'Default'}")
+            lines.append(f"- Line-profile text size: {lp.text_label_size if lp.text_label_size else 'Default'}")
             if lp.curve_settings:
                 lines.append("- Curve settings:")
                 for output_name in lp.selected_output_names:
@@ -3681,7 +3824,7 @@ class WelcomePage(QWizardPage):
         self.logo_label = QLabel()
         self.logo_label.setAlignment(Qt.AlignCenter)
 
-        icon_path = resource_path("pngElementti_1_0_8.png")
+        icon_path = resource_path("pngElementti_1_0_9.png")
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path)
             self.logo_label.setPixmap(
@@ -5281,10 +5424,12 @@ class DisplaySettingsPage(QWizardPage):
             "Choose colormaps, limits, colorbar labels, and optional manual bins.",
             "Display settings help",
             "Use this page to control how each selected output will appear in the exported figures. Each row corresponds to one direct map, ratio map, or custom formula map selected earlier.\n\n"
-            "Continuous mode displays the map using a Matplotlib colormap and a minimum/maximum range. If display min or max is left blank, Elementti uses the processed visible minimum or maximum calculated for that output. If values are clipped by a manual display min or max, the colorbar endpoint is labeled with ≤ or ≥, for example ≥21, so the figure makes clear that values at and above the chosen maximum share the top color.\n\n"
+            "Continuous mode displays the map using a Matplotlib colormap and a minimum/maximum range. If the Disp min or Disp max field is left blank, Elementti uses the data minimum or maximum calculated for that output, shown in the Data min and Data max columns (rounded to at most four decimals). The Disp min and Disp max fields also accept at most four decimals. If values are clipped by a manual Disp min or Disp max, the colorbar endpoint is labeled with ≤ or ≥, for example ≥21, so the figure makes clear that values at and above the chosen maximum share the top color.\n\n"
             "Manual-bin mode groups values into user-defined intervals. Enter boundary values separated by commas, for example 0, 0.5, 1, 1.5, 2. If you use decimal commas, separate bin boundaries with semicolons, for example 0; 0,5; 1,0. You must provide one fewer color than the number of boundaries, because each interval needs one color.\n\n"
             "Colors can be common color names such as white, black, gray, red, orange, yellow, green, cyan, blue, purple, magenta, or brown. Hex colors are also accepted, for example #FFFFFF, #000000, #FF0000, #00FF00, #0000FF, and #FFA500.\n\n"
             "Colorbar labels and colorbar side can be adjusted for each output. These settings are saved in the JSON summary so the figure preparation is traceable.\n\n"
+            "The Tick size column sets the font size of the colorbar numbers for each output separately. It shows the size as a whole number (the normal size is 10); type any whole number from 8 to 20 to make the numbers smaller or larger. Each output can use its own tick size.\n\n"
+            "The Text size column works the same way but sets the font size of the colorbar text label (the descriptive guide-bar label) for each output. It shows the size as a whole number (normally 10); type any whole number from 8 to 20.\n\n"
             "This page also lets you choose whether Elementti should export additional figures with physical scale bars. Pixel sizes are entered per input file in Step 4 and stored internally as µm/pixel. Step 4 can auto-convert clear metadata or typed entries using nm, µm/um, mm, cm, or m per pixel. If a scale-bar length is left blank, Elementti automatically chooses a clean rounded length close to one fifth to one fourth of each map width, using readable labels such as 500 nm, 20 µm, or 1 mm. If you enter a manual length, it must be large enough to be visible and not too large for the image."
         )
 
@@ -5317,26 +5462,36 @@ class DisplaySettingsPage(QWizardPage):
         scale_row_1.addStretch()
         layout.addLayout(scale_row_1)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
             [
                 "Output",
                 "Mode",
                 "Colormap",
-                "Guide bar side",
-                "Guide bar label",
-                "Processed min",
-                "Processed max",
-                "Display min",
-                "Display max",
+                "Bar side",
+                "Bar label",
+                "Data min",
+                "Data max",
+                "Disp min",
+                "Disp max",
                 "Bins",
                 "Bin colors",
+                "Tick size",
+                "Text size",
             ]
         )
-        for col in range(11):
-            self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Stretch)
+        header = self.table.horizontalHeader()
+        for col in range(13):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        # Bins and Bin colors stretch to absorb the remaining width.
+        header.setSectionResizeMode(9, QHeaderView.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.Stretch)
+        # The Disp min/max and Tick/Text size cells hold short editors that otherwise inherit a
+        # wide default width under ResizeToContents. Give them compact fixed widths so they stop
+        # crowding out Bins and Bin colors. Widths are sized to fit the column headers.
+        for col, width in ((7, 78), (8, 78), (11, 70), (12, 70)):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+            self.table.setColumnWidth(col, width)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -5391,11 +5546,11 @@ class DisplaySettingsPage(QWizardPage):
             if self.table.rowCount() > 0:
                 self.table.selectRow(0)
             self.draw_selected_output_preview()
-            self.status_label.setText("Processed min/max were calculated successfully.")
+            self.status_label.setText("Data min/max were calculated successfully.")
         except Exception as e:
             QMessageBox.warning(
                 self,
-                "Could not calculate processed min/max",
+                "Could not calculate data min/max",
                 f"The app could not read one of the files with the current settings.\n\n{str(e)}"
             )
             self.preview_figure.clear()
@@ -5489,21 +5644,29 @@ class DisplaySettingsPage(QWizardPage):
             colorbar_label_edit.textChanged.connect(self.schedule_preview_update)
             self.table.setCellWidget(row, 4, colorbar_label_edit)
 
-            min_item = QTableWidgetItem("" if min_val is None else f"{min_val:g}")
+            min_item = QTableWidgetItem("" if min_val is None else format_table_number_4dp(min_val))
             min_item.setFlags(min_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, 5, min_item)
 
-            max_item = QTableWidgetItem("" if max_val is None else f"{max_val:g}")
+            max_item = QTableWidgetItem("" if max_val is None else format_table_number_4dp(max_val))
             max_item.setFlags(max_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, 6, max_item)
 
             display_min_edit = QLineEdit(settings.display_min)
-            display_min_edit.setPlaceholderText("use processed min")
+            display_min_edit.setPlaceholderText("(auto)")
+            display_min_edit.setToolTip("Display minimum. Leave blank to use the data minimum (Data min). At most 4 decimals.")
+            display_min_edit.setValidator(
+                QRegularExpressionValidator(QRegularExpression(r"^-?\d*(\.\d{0,4})?$"), display_min_edit)
+            )
             display_min_edit.textChanged.connect(self.schedule_preview_update)
             self.table.setCellWidget(row, 7, display_min_edit)
 
             display_max_edit = QLineEdit(settings.display_max)
-            display_max_edit.setPlaceholderText("use processed max")
+            display_max_edit.setPlaceholderText("(auto)")
+            display_max_edit.setToolTip("Display maximum. Leave blank to use the data maximum (Data max). At most 4 decimals.")
+            display_max_edit.setValidator(
+                QRegularExpressionValidator(QRegularExpression(r"^-?\d*(\.\d{0,4})?$"), display_max_edit)
+            )
             display_max_edit.textChanged.connect(self.schedule_preview_update)
             self.table.setCellWidget(row, 8, display_max_edit)
 
@@ -5516,6 +5679,22 @@ class DisplaySettingsPage(QWizardPage):
             bin_colors_edit.setPlaceholderText("Example: blue, green, yellow, red or #FF0000")
             bin_colors_edit.textChanged.connect(self.schedule_preview_update)
             self.table.setCellWidget(row, 10, bin_colors_edit)
+
+            number_size_edit = QLineEdit(normalize_label_font_size(settings.tick_label_size))
+            number_size_edit.setValidator(QIntValidator(LABEL_FONT_SIZE_MIN, LABEL_FONT_SIZE_MAX, number_size_edit))
+            number_size_edit.setToolTip(
+                f"Font size of the colorbar numbers for this output. Whole number from {LABEL_FONT_SIZE_MIN} to {LABEL_FONT_SIZE_MAX}."
+            )
+            number_size_edit.textChanged.connect(self.schedule_preview_update)
+            self.table.setCellWidget(row, 11, number_size_edit)
+
+            text_size_edit = QLineEdit(normalize_label_font_size(settings.text_label_size))
+            text_size_edit.setValidator(QIntValidator(LABEL_FONT_SIZE_MIN, LABEL_FONT_SIZE_MAX, text_size_edit))
+            text_size_edit.setToolTip(
+                f"Font size of the colorbar text label for this output. Whole number from {LABEL_FONT_SIZE_MIN} to {LABEL_FONT_SIZE_MAX}."
+            )
+            text_size_edit.textChanged.connect(self.schedule_preview_update)
+            self.table.setCellWidget(row, 12, text_size_edit)
 
             self.on_mode_changed(row)
 
@@ -5566,6 +5745,8 @@ class DisplaySettingsPage(QWizardPage):
             display_max=self.table.cellWidget(row, 8).text().strip(),
             bins=self.table.cellWidget(row, 9).text().strip(),
             bin_colors=self.table.cellWidget(row, 10).text().strip(),
+            tick_label_size=normalize_label_font_size(self.table.cellWidget(row, 11).text()),
+            text_label_size=normalize_label_font_size(self.table.cellWidget(row, 12).text()),
         )
 
     def current_scale_bar_preview_settings(self) -> ScaleBarSettings:
@@ -5746,6 +5927,8 @@ class DisplaySettingsPage(QWizardPage):
             display_max_text = self.table.cellWidget(row, 8).text().strip()
             bins_text = self.table.cellWidget(row, 9).text().strip()
             bin_colors_text = self.table.cellWidget(row, 10).text().strip()
+            number_size_text = normalize_label_font_size(self.table.cellWidget(row, 11).text())
+            text_size_text = normalize_label_font_size(self.table.cellWidget(row, 12).text())
 
             if not self.validate_number_or_blank(display_min_text, "Display minimum", output_name):
                 return False
@@ -5771,6 +5954,8 @@ class DisplaySettingsPage(QWizardPage):
                 display_max=display_max_text,
                 bins=bins_text,
                 bin_colors=bin_colors_text,
+                tick_label_size=number_size_text,
+                text_label_size=text_size_text,
             )
 
         scale_enabled = (self.scale_bar_enable_combo.currentText() == "Yes")
@@ -6090,8 +6275,11 @@ class LineProfilePage(QWizardPage):
         axis_row = QHBoxLayout()
         axis_row.addWidget(QLabel("X label:"))
         self.x_label_edit = QLineEdit()
-        self.x_label_edit.setPlaceholderText("Auto: physical distance if pixel size is available")
-        self.x_label_edit.textChanged.connect(self.on_controls_changed)
+        self.x_label_edit.setToolTip(
+            "Distance label under the line-profile plot. It starts filled with the automatic "
+            "distance label as normal text; edit it freely, or clear it to show no x-axis label."
+        )
+        self.x_label_edit.textEdited.connect(self.on_x_label_edited)
         axis_row.addWidget(self.x_label_edit, stretch=1)
         axis_row.addWidget(QLabel("Left Y label:"))
         self.y_label_edit = QLineEdit()
@@ -6133,6 +6321,20 @@ class LineProfilePage(QWizardPage):
         self.legend_position_combo.setToolTip("Move the line-profile legend outside the plot when many curves make the figure crowded.")
         self.legend_position_combo.currentTextChanged.connect(self.on_controls_changed)
         legend_row.addWidget(self.legend_position_combo)
+        legend_row.addSpacing(12)
+        legend_row.addWidget(QLabel("Number size:"))
+        self.tick_size_combo = QComboBox()
+        self.tick_size_combo.addItems(TICK_LABEL_SIZE_OPTIONS)
+        self.tick_size_combo.setToolTip("Font size of the line-profile axis numbers. 'Default' keeps the normal size.")
+        self.tick_size_combo.currentTextChanged.connect(self.on_controls_changed)
+        legend_row.addWidget(self.tick_size_combo)
+        legend_row.addSpacing(12)
+        legend_row.addWidget(QLabel("Text size:"))
+        self.text_size_combo = QComboBox()
+        self.text_size_combo.addItems(TICK_LABEL_SIZE_OPTIONS)
+        self.text_size_combo.setToolTip("Font size of the line-profile text labels (axis labels, title, legend, and map-panel labels). 'Default' keeps the normal size.")
+        self.text_size_combo.currentTextChanged.connect(self.on_controls_changed)
+        legend_row.addWidget(self.text_size_combo)
         legend_row.addStretch()
         style_layout.addLayout(legend_row)
 
@@ -6225,14 +6427,20 @@ class LineProfilePage(QWizardPage):
         self.image_x_label_edit.setText(lp.image_x_label or "")
         self.image_y_label_edit.setText(lp.image_y_label or "")
         self.title_edit.setText(lp.title or "")
-        x_label_text = "" if lp.x_label == "Distance along line (pixels)" else (lp.x_label or "")
-        self.x_label_edit.setText(x_label_text)
+        if lp.x_label_is_custom:
+            self.x_label_edit.setText(lp.x_label)
+        else:
+            self.x_label_edit.setText(self.compute_default_distance_label())
         self.y_label_edit.setText(lp.y_label or "Value")
         self.y_min_edit.setText(lp.y_min or "")
         self.y_max_edit.setText(lp.y_max or "")
         self.right_y_min_edit.setText(lp.right_y_min or "")
         self.right_y_max_edit.setText(lp.right_y_max or "")
         self.legend_position_combo.setCurrentText(normalize_line_profile_legend_position(lp.legend_position))
+        current_tick_size = lp.tick_label_size if lp.tick_label_size in TICK_LABEL_SIZE_OPTIONS else "Default"
+        self.tick_size_combo.setCurrentText(current_tick_size)
+        current_text_size = lp.text_label_size if lp.text_label_size in TICK_LABEL_SIZE_OPTIONS else "Default"
+        self.text_size_combo.setCurrentText(current_text_size)
 
         self.curve_table.blockSignals(True)
         self.curve_table.setRowCount(0)
@@ -6374,13 +6582,18 @@ class LineProfilePage(QWizardPage):
         lp.image_x_label = self.image_x_label_edit.text().strip()
         lp.image_y_label = self.image_y_label_edit.text().strip()
         lp.title = self.title_edit.text().strip()
-        lp.x_label = self.x_label_edit.text().strip()
+        if lp.x_label_is_custom:
+            # Stored exactly as typed; an empty value means no x-axis label.
+            lp.x_label = self.x_label_edit.text().strip()
+        # When not custom, lp.x_label stays empty and the automatic distance label is used.
         lp.y_label = self.y_label_edit.text().strip() or "Value"
         lp.y_min = self.y_min_edit.text().strip()
         lp.y_max = self.y_max_edit.text().strip()
         lp.right_y_min = self.right_y_min_edit.text().strip()
         lp.right_y_max = self.right_y_max_edit.text().strip()
         lp.legend_position = normalize_line_profile_legend_position(self.legend_position_combo.currentText())
+        lp.tick_label_size = self.tick_size_combo.currentText().strip() or "Default"
+        lp.text_label_size = self.text_size_combo.currentText().strip() or "Default"
 
         selected, curve_settings = self.get_curve_table_settings()
         lp.selected_output_names = selected
@@ -6402,6 +6615,8 @@ class LineProfilePage(QWizardPage):
             self.right_y_min_edit,
             self.right_y_max_edit,
             self.legend_position_combo,
+            self.tick_size_combo,
+            self.text_size_combo,
             self.combined_canvas,
             self.clear_line_button,
             self.curve_table,
@@ -6419,6 +6634,76 @@ class LineProfilePage(QWizardPage):
         self.sync_controls_to_state()
         self.update_enabled_state()
         self.redraw_all()
+
+    def compute_default_distance_label(self) -> str:
+        """Best-effort automatic x-axis label for the line profile.
+
+        This mirrors the label the engine assigns for the current base output
+        and drawn line, so the editable field can be pre-filled with the real
+        default as normal (black) text instead of a grey placeholder. It relies
+        only on the saved processing settings and the stored line coordinates,
+        so it is safe to call before the output arrays cache has been loaded.
+        """
+        lp = self.state.line_profile_settings
+        base_name = lp.base_output_name
+        pixel_size_um = None
+        if base_name:
+            try:
+                pixel_size_um = self.wizard().engine.get_pixel_size_um_for_output(base_name)
+            except Exception:
+                pixel_size_um = None
+
+        if pixel_size_um is None or pixel_size_um <= 0:
+            return "Distance along line (pixels)"
+
+        if (
+            lp.start_x is not None
+            and lp.start_y is not None
+            and lp.end_x is not None
+            and lp.end_y is not None
+        ):
+            length_px = float(
+                np.hypot(float(lp.end_x) - float(lp.start_x), float(lp.end_y) - float(lp.start_y))
+            )
+            try:
+                _, _, label, _ = self.wizard().engine.choose_line_profile_distance_axis(
+                    np.array([0.0, length_px]), pixel_size_um
+                )
+                return label
+            except Exception:
+                return "Distance along line (µm)"
+
+        return "Distance along line (µm)"
+
+    def on_x_label_edited(self, _text):
+        """Mark the x-axis label as user-controlled once the field is edited.
+
+        textEdited (not textChanged) fires only on genuine typing or clearing by
+        the user, so programmatic updates to the field never flip this flag. Once
+        custom, the typed text is used exactly, and an empty field means no
+        x-axis label is drawn at all.
+        """
+        if self._updating_controls:
+            return
+        lp = self.state.line_profile_settings
+        lp.x_label_is_custom = True
+        lp.x_label = self.x_label_edit.text().strip()
+        self.redraw_all()
+
+    def _refresh_default_x_label_display(self):
+        """Keep the pre-filled default label in sync with the real unit.
+
+        While the user has not customised the field, show the same automatic
+        label the export would use (its unit depends on the drawn line and pixel
+        size). setText fires textChanged, not textEdited, so this never flips the
+        custom flag; the guard is an extra safeguard.
+        """
+        lp = self.state.line_profile_settings
+        if lp.x_label_is_custom:
+            return
+        self._updating_controls = True
+        self.x_label_edit.setText(self.compute_default_distance_label())
+        self._updating_controls = False
 
     def on_base_output_changed(self, *_args):
         if self._updating_controls:
@@ -6532,6 +6817,7 @@ class LineProfilePage(QWizardPage):
             return
 
         self.sync_controls_to_state()
+        self._refresh_default_x_label_display()
         lp = self.state.line_profile_settings
         legend_outside = normalize_line_profile_legend_position(lp.legend_position) == "Outside right"
 
@@ -6592,6 +6878,11 @@ class LineProfilePage(QWizardPage):
                 self.map_ax.set_title(lp.image_title.strip(), fontname=DEFAULT_FONT_NAME)
             if lp.image_x_label.strip():
                 self.map_ax.set_xlabel(lp.image_x_label.strip(), fontname=DEFAULT_FONT_NAME)
+            lp_text_size = parse_tick_label_size(lp.text_label_size)
+            if lp_text_size is not None:
+                self.map_ax.title.set_fontsize(lp_text_size)
+                self.map_ax.xaxis.label.set_fontsize(lp_text_size)
+                cax.yaxis.label.set_fontsize(lp_text_size)
 
         # If only the start point is known, show it even though there is no full line yet.
         if lp.start_x is not None and lp.start_y is not None and line_coords is None:
@@ -6832,11 +7123,13 @@ class GeneratePage(QWizardPage):
         self.citation_title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout.addWidget(self.citation_title_label)
 
-        self.citation_label = QLabel(APP_CITATION_TEXT)
+        self.citation_label = QLabel(APP_CITATION_HTML)
+        self.citation_label.setTextFormat(Qt.RichText)
         self.citation_label.setWordWrap(True)
         self.citation_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.citation_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        self.citation_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.citation_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.citation_label.setOpenExternalLinks(True)
         layout.addWidget(self.citation_label)
 
         set_page_layout(self, layout)
