@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.0.9
+
+Post-publication update of Elementti.
+
+### Added
+
+* Added a per-output **Tick size** control that sets the font size of the colorbar numbers.
+* Added a per-output **Text size** control that sets the font size of the colorbar text label.
+* Added matching **Tick size** and **Text size** controls to the line profile, covering axis numbers, axis labels, title, legend, and map-panel labels.
+* Recorded the new size, label, and x-axis-label settings in the JSON summary and methods text for traceability.
+
+### Changed
+
+* Updated the in-app citation to the published SoftwareX reference, with the paper title shown in bold.
+* Placed the citation DOI on its own line and made it a clickable link that opens in the browser.
+* Tick size and Text size are typed as whole numbers from `8` to `20`, showing the real default of `10` instead of the word **Default**.
+* Shortened the display-settings column headers for readability: **Bar side**, **Bar label**, **Data min**, **Data max**, **Disp min**, **Disp max**, and **Tick size**.
+* Data min and Data max are now shown rounded to at most four decimals.
+* Disp min and Disp max now accept at most four decimals.
+* Made the Disp min/max and Tick/Text size columns more compact so **Bins** and **Bin colors** keep enough width.
+* Updated icon and welcome-image resource names to `icoElementti_1_0_9.ico` and `pngElementti_1_0_9.png`. Older resource names still load as a fallback.
+
+### Fixed
+
+* Fixed the line-profile x-axis label: it starts filled with the automatic distance label as normal editable text, and clearing it now shows no x-axis label.
+
 ## v1.0.8
 
 Post-publication update of Elementti.
@@ -57,13 +83,18 @@ Post-publication update of Elementti.
 
 ## v1.0.1
 
+* Added dynamic display.
+* Added linescan.
+
+## v1.0.0
+
 * Original baseline version.
-* Supports CSV map loading, map selection, simple ratios, display settings, masks, scale bars, line profiles, and export.
 
 ## Notes
 
-* The SoftwareX-published version is **v1.0.0**.
-* The current updated post-publication version is **v1.0.8**.
+* The SoftwareX-published baseline version is **v1.0.0**.
+* The current updated post-publication version is **v1.0.9**.
+* Latest version file: `Elementti_1_0_9.py`.
 * Always check detected pixel size before final export.
 * Display min/max changes the color scale; it does not remove data.
 * Values above display max use the top color, and values below display min use the bottom color.
