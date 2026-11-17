@@ -1,4 +1,9 @@
+# Excel report export requires openpyxl: python -m pip install openpyxl
 import sys
+import hashlib
+import copy
+import colorsys
+import uuid
 import os
 import io
 import csv
@@ -33,6 +38,8 @@ matplotlib.rcParams["font.family"] = [DEFAULT_FONT_NAME, "sans-serif"]
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.path import Path as MplPath
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.colors import (
     is_color_like,
     ListedColormap,
@@ -41,9 +48,10 @@ from matplotlib.colors import (
     to_rgba,
     to_rgb,
 )
+from matplotlib import patheffects
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QRegularExpression
+from PySide6.QtCore import Qt, QTimer, QUrl, QRegularExpression, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap, QIcon, QIntValidator, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -71,11 +79,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QSizePolicy,
+    QSpinBox,
 )
 
 
 APP_NAME = "Elementti"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 DEFAULT_SAMPLE_SEED = 42
 
 APP_DEVELOPER_TEXT = (
@@ -105,6 +114,74 @@ APP_CITATION_HTML = (
     '<a href="https://doi.org/10.1016/j.softx.2026.102826">'
     "https://doi.org/10.1016/j.softx.2026.102826</a>."
 )
+
+
+# Shared interaction styling. Preserve native control frames and keyboard
+# focus indicators; only add colour to hover and selection states.
+INTERACTION_STYLE = """
+QPushButton:enabled:hover, QToolButton:enabled:hover {
+    background-color: #EAF3FD; color: #0F172A;
+}
+QPushButton:enabled:pressed, QToolButton:enabled:pressed {
+    background-color: #C6DDF6; color: #0F172A;
+}
+QPushButton:checked, QToolButton:checked {
+    background-color: #DCEBFA; color: #0F172A;
+}
+QPushButton:checked:hover, QToolButton:checked:hover {
+    background-color: #C6DDF6; color: #0F172A;
+}
+QAbstractSpinBox:enabled:hover, QLineEdit:enabled:hover {
+    background-color: #F0F6FE; color: #0F172A;
+}
+QCheckBox:enabled:hover, QRadioButton:enabled:hover {
+    background-color: #EAF3FD; color: #0F172A;
+}
+QListView, QTableView, QTreeView, QComboBox QAbstractItemView {
+    selection-background-color: #DCEBFA; selection-color: #0F172A;
+}
+QListView::item:hover:!selected, QTableView::item:hover:!selected,
+QTreeView::item:hover:!selected {
+    background-color: #EAF3FD; color: #0F172A;
+}
+QListView::item:selected, QTableView::item:selected,
+QTreeView::item:selected {
+    background-color: #DCEBFA; color: #0F172A;
+}
+QListView::item:selected:!active, QTableView::item:selected:!active,
+QTreeView::item:selected:!active {
+    background-color: #E8F1FB; color: #0F172A;
+}
+QTabBar::tab:hover:!selected {
+    background-color: #EAF3FD; color: #0F172A;
+}
+QTabBar::tab:selected {
+    background-color: #DCEBFA; color: #0F172A;
+}
+QLabel#interactionMode {
+    background-color: #DCEBFA; color: #0F172A;
+    border: 1px solid #9BBDE2; border-radius: 4px;
+    padding: 4px 8px; font-weight: 600;
+}
+QToolTip {
+    background-color: #F0F6FE; color: #0F172A;
+    border: 1px solid #9BBDE2; padding: 5px;
+}
+"""
+
+
+class InteractionToolbar(NavigationToolbar2QT):
+    """Notify the page when mouse navigation changes, including shortcuts."""
+    modeChanged = Signal()
+
+    def pan(self, *args):
+        super().pan(*args)
+        self.modeChanged.emit()
+
+    def zoom(self, *args):
+        super().zoom(*args)
+        self.modeChanged.emit()
+
 
 
 def set_compact_layout(layout: QVBoxLayout) -> None:
@@ -283,6 +360,84 @@ def add_inside_top_legend_only(ax, handles, labels, max_columns: int = 4) -> Non
         legend.set_zorder(10000)
     except Exception:
         pass
+
+
+def fit_area_chart_legend(ax) -> None:
+    """Place the legend of an area-analysis chart inside the plot, above the bars.
+
+    The legend is measured as it will be drawn: it gets fewer columns when it is wider than the plot,
+    and the y-axis gets just enough headroom for the bars to stay below it. Call it again after the
+    size of the axes has changed.
+    """
+    info = getattr(ax, "_elementti_area_legend", None)
+    if not info:
+        return
+    legend_axis = info["legend_axis"]
+    handles, labels = info["handles"], info["labels"]
+    try:
+        renderer = ax.figure.canvas.get_renderer()
+        axes_box = ax.get_window_extent(renderer)
+    except Exception:
+        renderer, axes_box = None, None
+
+    old_legend = legend_axis.get_legend()
+    if old_legend is not None:
+        old_legend.remove()
+
+    if info.get("outside"):
+        right_axis = info.get("right_axis")
+        anchor_x = 1.03
+        if right_axis is not None:
+            anchor_x = 1.22
+            try:                                   # just beyond the numbers and the label of the right y-axis
+                axis_box = right_axis.yaxis.get_tightbbox(renderer)
+                anchor_x = max(1.03, (axis_box.x1 - axes_box.x0) / axes_box.width + 0.04)
+            except Exception:
+                pass
+        legend = legend_axis.legend(
+            handles, labels, loc="upper left", bbox_to_anchor=(anchor_x, 1.0), ncol=1, frameon=True,
+            framealpha=0.92, facecolor="white", edgecolor="none", borderaxespad=0.0,
+            fontsize=info.get("fontsize", "small"), handlelength=1.4, handletextpad=0.5, labelspacing=0.45,
+        )
+        try:
+            legend._legend_box.align = "left"
+            legend.set_zorder(10000)
+        except Exception:
+            pass
+        return
+
+    legend, legend_box = None, None
+    for columns in range(max(1, min(len(handles), 3)), 0, -1):
+        legend = legend_axis.legend(
+            handles, labels, loc="upper center", ncol=columns, frameon=True, framealpha=0.92,
+            facecolor="white", edgecolor="none", fontsize=info.get("fontsize", "small"), handlelength=1.4,
+            handletextpad=0.5, columnspacing=1.0, borderaxespad=0.3,
+        )
+        if renderer is None:
+            break
+        try:
+            legend_box = legend.get_window_extent(renderer)
+        except Exception:
+            legend_box = None
+            break
+        if columns == 1 or legend_box.width <= 0.96 * axes_box.width:
+            break
+        legend.remove()
+    try:
+        legend.set_zorder(10000)
+    except Exception:
+        pass
+
+    if legend_box is not None and axes_box is not None and axes_box.height > 0:
+        legend_fraction = min(0.62, legend_box.height / axes_box.height + 0.06)
+    else:
+        rows = int(np.ceil(len(handles) / max(1, min(len(handles), 3))))
+        legend_fraction = min(0.62, 0.10 + 0.10 * rows)
+    for axis_obj, bottom, top in info["value_ranges"]:
+        span = top - bottom
+        if span <= 0:
+            continue
+        axis_obj.set_ylim(bottom - (0.06 * span if bottom < 0 else 0.0), bottom + span / (1.0 - legend_fraction))
 
 
 def normalize_line_profile_legend_position(position: str) -> str:
@@ -1696,6 +1851,948 @@ DEFAULT_LINE_PROFILE_COLORS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Elementti 1.1.1: area analysis (regions drawn on a map)
+# ---------------------------------------------------------------------------
+
+AREA_SHAPES = ["Rectangle", "Square", "Ellipse", "Circle", "Polygon", "Freehand"]
+# Shapes stored as two opposite corners of the box around them.
+AREA_TWO_POINT_SHAPES = ("Rectangle", "Square", "Ellipse", "Circle")
+AREA_ERROR_BAR_OPTIONS = ["None", "Standard deviation"]
+
+# Outline colours that stay visible on a greyscale image, on a colour map and on a white chart.
+DEFAULT_AREA_REGION_COLORS = [
+    "red",
+    "dodgerblue",
+    "orange",
+    "magenta",
+    "limegreen",
+    "gold",
+    "turquoise",
+    "sienna",
+    "blueviolet",
+    "deeppink",
+]
+
+
+@dataclass
+class AreaRegion:
+    name: str = ""
+    shape: str = "Rectangle"
+    # Outline in pixel coordinates, [[x, y], ...]. Rectangle, Square, Ellipse and Circle: two opposite
+    # corners of the box around the shape. Polygon and Freehand: the corner points in the order drawn.
+    points: List[List[float]] = field(default_factory=list)
+    color: str = ""
+    region_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+@dataclass
+class AreaAnalysisSettings:
+    enabled: bool = False
+    base_output_name: str = ""
+    selected_output_names: List[str] = field(default_factory=list)
+    regions: List[AreaRegion] = field(default_factory=list)
+    # Pixels hidden by a greyscale mask (pores, resin, background) are left out of the statistics.
+    exclude_masked: bool = True
+    use_processed_values: bool = False
+    common_pixels: bool = True
+    grid_signature: dict = field(default_factory=dict)
+    plot_selection_initialized: bool = False
+    region_fill_opacity: int = 12
+    detail_enabled: bool = False
+    detail_bounds: List[float] = field(default_factory=list)
+    detail_region_mode: str = "Visible regions"
+    detail_region_ids: List[str] = field(default_factory=list)
+    # The means of the selected element maps are rescaled so that they add up to 100.
+    normalize_to_100: bool = False
+    error_bars: str = "None"
+    show_region_labels: bool = True
+    image_title: str = ""
+    title: str = ""
+    # Blank labels mean automatic.
+    y_label: str = ""
+    right_y_label: str = ""
+    legend_position: str = "Inside plot"
+    tick_label_size: str = "Default"
+    text_label_size: str = "Default"
+
+
+def area_data_type(file_path: str) -> str:
+    """Read the declared units from the header, never from a filename."""
+    try:
+        with open(file_path, "rb") as f:
+            text = f.read(65536).replace(b"\xa0", b" ").decode("utf-8-sig", errors="ignore")
+        for i, row in enumerate(csv.reader(io.StringIO(text))):
+            if i >= 20:
+                break
+            if len(row) > 1 and row[0].strip().lower() == "data type":
+                return row[1].strip()
+    except (OSError, csv.Error):
+        pass
+    return ""
+
+
+def area_unit_info(data_type: str, scale_factor: str) -> dict:
+    text = unicodedata.normalize("NFKC", data_type).upper().replace(" ", "").replace("×", "X")
+    match = re.fullmatch(r"(AT%|ATOMIC%|ATOMICPCT|WT%|WEIGHT%|WEIGHTPCT)(?:X(\d+(?:\.\d+)?))?", text)
+    expected, warning = None, ""
+    if match:
+        divisor = float(match.group(2) or "1")
+        if divisor <= 0:
+            return dict(unit="scaled values", data_type=data_type, scale_factor=scale_factor,
+                        expected_scale_factor=None, warning="Invalid percentage multiplier in the header.")
+        expected = 1.0 / divisor
+        unit = "at.%" if match.group(1).startswith("AT") else "wt.%"
+        if not np.isclose(parse_float_user_text(scale_factor, "Scale factor"), expected, rtol=1e-9, atol=0):
+            unit, warning = "scaled values", f"Declared {data_type} needs scale factor {expected:g}."
+    elif text == "VIDEO":
+        unit = "greyscale"
+    elif "COUNT" in text:
+        unit = "counts" if np.isclose(parse_float_user_text(scale_factor, "Scale factor"), 1) else "scaled counts"
+    else:
+        unit = "scaled values"
+    return dict(unit=unit, data_type=data_type or "Not declared", scale_factor=scale_factor,
+                expected_scale_factor=expected, warning=warning)
+
+
+def area_crop_settings(settings) -> dict:
+    return dict(removed_rows=sorted(set(parse_manual_index_list(settings.manual_rows, "Rows to remove"))),
+                removed_columns=sorted(set(parse_manual_index_list(settings.manual_columns, "Columns to remove"))),
+                pixel_size_um=(parse_pixel_size_text_to_um(settings.pixel_size_um, "Pixel size")
+                               if str(settings.pixel_size_um).strip() else None))
+
+
+def area_csv_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+def normalize_area_shape(shape) -> str:
+    text = str(shape or "").strip().lower()
+    for name in AREA_SHAPES:
+        if name.lower() == text:
+            return name
+    return "Rectangle"
+
+
+def area_points_array(points) -> np.ndarray:
+    """The points as an (N, 2) array of finite numbers; anything unreadable is left out."""
+    clean = []
+    for point in ([] if points is None else points):
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if np.isfinite(x) and np.isfinite(y):
+            clean.append((x, y))
+    return np.array(clean, dtype=float).reshape(-1, 2)
+
+
+def clamp_area_points(points, array_shape: Tuple[int, int]) -> List[List[float]]:
+    """Keep every point on the map: x in 0 .. columns - 1 and y in 0 .. rows - 1."""
+    rows, cols = array_shape
+    pts = area_points_array(points)
+    if pts.size == 0:
+        return []
+    pts[:, 0] = np.clip(pts[:, 0], 0, cols - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, rows - 1)
+    return [[round(float(x), 2), round(float(y), 2)] for x, y in pts]
+
+
+def square_second_corner(x0: float, y0: float, x1: float, y1: float,
+                         array_shape: Optional[Tuple[int, int]] = None) -> Tuple[float, float]:
+    """The corner opposite (x0, y0) of the square drawn towards (x1, y1), kept on the map."""
+    dx, dy = float(x1) - float(x0), float(y1) - float(y0)
+    side = max(abs(dx), abs(dy))
+    sign_x = -1.0 if dx < 0 else 1.0
+    sign_y = -1.0 if dy < 0 else 1.0
+    if array_shape is not None:
+        rows, cols = array_shape
+        room_x = (cols - 1 - float(x0)) if sign_x > 0 else float(x0)
+        room_y = (rows - 1 - float(y0)) if sign_y > 0 else float(y0)
+        side = max(0.0, min(side, room_x, room_y))
+    return float(x0) + sign_x * side, float(y0) + sign_y * side
+
+
+def simplify_area_path(points, tolerance: float = 0.35, max_points: int = 1500) -> List[List[float]]:
+    """Fewer points for a freehand outline (Ramer-Douglas-Peucker): no point of the drawn outline is
+    further than `tolerance` pixels from the simplified one."""
+    pts = area_points_array(points)
+    if len(pts) > 1:                          # drop points drawn twice in a row
+        keep = np.ones(len(pts), dtype=bool)
+        keep[1:] = np.any(np.abs(np.diff(pts, axis=0)) > 1e-9, axis=1)
+        pts = pts[keep]
+    if len(pts) > 2 and np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    if len(pts) <= 3:
+        return [[round(float(x), 2), round(float(y), 2)] for x, y in pts]
+
+    def simplify(tol: float) -> np.ndarray:
+        keep = np.zeros(len(pts), dtype=bool)
+        keep[0] = keep[-1] = True
+        stack = [(0, len(pts) - 1)]
+        while stack:
+            first, last = stack.pop()
+            if last <= first + 1:
+                continue
+            a, b = pts[first], pts[last]
+            seg = b - a
+            seg_len = float(np.hypot(seg[0], seg[1]))
+            mid = pts[first + 1:last]
+            if seg_len < 1e-12:
+                dist = np.hypot(mid[:, 0] - a[0], mid[:, 1] - a[1])
+            else:
+                projection = np.clip(np.sum((mid - a) * seg, axis=1) / (seg_len * seg_len), 0, 1)
+                dist = np.linalg.norm(mid - (a + projection[:, None] * seg), axis=1)
+            idx = int(np.argmax(dist))
+            if float(dist[idx]) > tol:
+                split = first + 1 + idx
+                keep[split] = True
+                stack.append((first, split))
+                stack.append((split, last))
+        return pts[keep]
+
+    tol = float(tolerance)
+    out = simplify(tol)
+    while len(out) > max_points:
+        tol *= 1.5
+        out = simplify(tol)
+    return [[round(float(x), 2), round(float(y), 2)] for x, y in out]
+
+
+def area_region_is_complete(region: AreaRegion) -> bool:
+    return polygon_area_mask_complete(region)
+
+
+def area_region_outline(region: AreaRegion, ellipse_points: int = 180) -> np.ndarray:
+    """The closed outline of a region as an (N, 2) array, for drawing."""
+    pts = area_points_array(region.points)
+    shape = normalize_area_shape(region.shape)
+    if shape in AREA_TWO_POINT_SHAPES:
+        if len(pts) < 2:
+            return np.zeros((0, 2))
+        (x0, y0), (x1, y1) = pts[0], pts[1]
+        if shape in ("Ellipse", "Circle"):
+            angle = np.linspace(0.0, 2.0 * np.pi, int(ellipse_points) + 1)
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            rx, ry = abs(x1 - x0) / 2.0, abs(y1 - y0) / 2.0
+            return np.column_stack([cx + rx * np.cos(angle), cy + ry * np.sin(angle)])
+        return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float)
+    if len(pts) < 2:
+        return pts
+    return np.vstack([pts, pts[:1]])
+
+
+def polygon_mask(points, array_shape: Tuple[int, int]) -> np.ndarray:
+    """Pixel centres inside/on the outline, using non-zero winding, including all edges.
+
+    Work one scanline at a time so freehand outlines do not allocate an image-sized
+    temporary array for every segment. Horizontal and upper/lower endpoints are
+    explicitly included, making a rectangular polygon identical to a rectangle.
+    """
+    rows, cols = array_shape
+    mask = np.zeros((rows, cols), dtype=bool)
+    pts = area_points_array(points)
+    if not polygon_encloses_area(pts):
+        return mask
+    x, y = pts[:, 0], pts[:, 1]
+    xn, yn = np.roll(x, -1), np.roll(y, -1)
+    first, last = max(0, int(np.ceil(y.min() - 1e-9))), min(rows - 1, int(np.floor(y.max() + 1e-9)))
+    for i in range(first, last + 1):
+        up, down = (y <= i) & (yn > i), (yn <= i) & (y > i)
+        cross = up | down
+        if np.any(cross):
+            xc = x[cross] + (i - y[cross]) * (xn[cross] - x[cross]) / (yn[cross] - y[cross])
+            order = np.argsort(xc, kind="stable")
+            winding = np.cumsum(np.where(up[cross], 1, -1)[order])
+            xc = xc[order]
+            for k in range(len(xc) - 1):
+                if winding[k]:
+                    a, b = max(0, int(np.ceil(xc[k] - 1e-9))), min(cols - 1, int(np.floor(xc[k+1] + 1e-9)))
+                    if a <= b:
+                        mask[i, a:b+1] = True
+        horizontal = (np.abs(y - i) <= 1e-9) & (np.abs(yn - i) <= 1e-9)
+        for a, b in zip(x[horizontal], xn[horizontal]):
+            lo, hi = max(0, int(np.ceil(min(a,b) - 1e-9))), min(cols-1, int(np.floor(max(a,b) + 1e-9)))
+            if lo <= hi:
+                mask[i, lo:hi+1] = True
+        non_horizontal = (np.abs(yn-y) > 1e-12) & (i >= np.minimum(y,yn)-1e-9) & (i <= np.maximum(y,yn)+1e-9)
+        if np.any(non_horizontal):
+            xc = x[non_horizontal] + (i-y[non_horizontal])*(xn[non_horizontal]-x[non_horizontal])/(yn[non_horizontal]-y[non_horizontal])
+            nearest = np.rint(xc).astype(int)
+            good = (np.abs(nearest-xc) <= 1e-8) & (nearest >= 0) & (nearest < cols)
+            mask[i, nearest[good]] = True
+    return mask
+
+
+def area_region_mask(region: AreaRegion, array_shape: Tuple[int, int]) -> np.ndarray:
+    """Include pixel centres on the boundary consistently for every shape."""
+    rows, cols = array_shape
+    mask = np.zeros((rows, cols), dtype=bool)
+    if not area_region_is_complete(region):
+        return mask
+    pts = area_points_array(region.points)
+    shape = normalize_area_shape(region.shape)
+    if shape not in AREA_TWO_POINT_SHAPES:
+        return polygon_mask(pts, array_shape)
+    xlo, ylo = np.minimum(pts[0],pts[1])
+    xhi, yhi = np.maximum(pts[0],pts[1])
+    a,b = max(0,int(np.ceil(xlo-1e-9))),min(cols-1,int(np.floor(xhi+1e-9)))
+    c,d = max(0,int(np.ceil(ylo-1e-9))),min(rows-1,int(np.floor(yhi+1e-9)))
+    if a>b or c>d:
+        return mask
+    if shape in ("Ellipse", "Circle"):
+        xx,yy=np.arange(a,b+1)[None,:],np.arange(c,d+1)[:,None]
+        mask[c:d+1,a:b+1]=((xx-(xlo+xhi)/2)/((xhi-xlo)/2))**2+((yy-(ylo+yhi)/2)/((yhi-ylo)/2))**2 <= 1+1e-9
+    else:
+        mask[c:d+1,a:b+1]=True
+    return mask
+
+
+def format_area_points(points) -> str:
+    """Points as editable text: 'x y; x y; ...'."""
+    return "; ".join(f"{x:.6g} {y:.6g}" for x, y in area_points_array(points))
+
+
+def parse_area_points(text: str) -> List[List[float]]:
+    """Read 'x y; x y; ...' (a decimal comma is accepted, as elsewhere in Elementti)."""
+    cleaned = unicodedata.normalize("NFKC", str(text)).replace("(", " ").replace(")", " ")
+    points = []
+    for index, chunk in enumerate(cleaned.split(";"), start=1):
+        parts = chunk.split()
+        if not parts:
+            continue
+        if len(parts) != 2:
+            raise ValueError(
+                f"Point {index} must be two numbers, x and y, separated by a space (points are separated by ';')."
+            )
+        points.append([
+            parse_float_user_text(parts[0], f"Point {index} x"),
+            parse_float_user_text(parts[1], f"Point {index} y"),
+        ])
+    return points
+
+
+def describe_area_region_outline(region: AreaRegion, max_points: int = 6) -> str:
+    """The outline in words, for the report."""
+    pts = area_points_array(region.points)
+    shape = normalize_area_shape(region.shape)
+    if len(pts) == 0:
+        return "no outline"
+    if shape in AREA_TWO_POINT_SHAPES:
+        if len(pts) < 2:
+            return "incomplete"
+        (x0, y0), (x1, y1) = pts[0], pts[1]
+        box = (f"x {min(x0, x1):.1f} to {max(x0, x1):.1f}, y {min(y0, y1):.1f} to {max(y0, y1):.1f}")
+        return ("inside the box " if shape == "Ellipse" else "") + box
+    if len(pts) <= max_points:
+        return "corners " + "; ".join(f"({x:.1f}, {y:.1f})" for x, y in pts)
+    return (f"{len(pts)} points within x {float(np.min(pts[:, 0])):.1f} to {float(np.max(pts[:, 0])):.1f}, "
+            f"y {float(np.min(pts[:, 1])):.1f} to {float(np.max(pts[:, 1])):.1f}")
+
+
+def format_area_um2(area_um2: Optional[float]) -> str:
+    if area_um2 is None or not np.isfinite(area_um2):
+        return ""
+    def four_digits(value: float) -> str:              # four significant digits, never as 1.2e+05
+        return np.format_float_positional(float(f"{value:.4g}"), trim="-")
+
+    if area_um2 >= 1.0e6:
+        return f"{four_digits(area_um2 / 1.0e6)} mm²"
+    return f"{four_digits(area_um2)} µm²"
+
+
+def unique_area_region_name(existing_names, base: str = "Region") -> str:
+    used = {str(name).strip().lower() for name in existing_names}
+    number = 1
+    while f"{base} {number}".lower() in used:
+        number += 1
+    return f"{base} {number}"
+
+
+def canonical_region_color(color):
+    rgba=to_rgba(color)
+    if rgba[3] < 1:
+        raise ValueError("Choose an opaque outline colour; fill opacity is controlled separately.")
+    return "#"+"".join(f"{int(round(v*255)):02x}" for v in rgba[:3])
+
+
+def ensure_unique_region_colors(regions):
+    used=[]
+    changed=False
+    for region in regions:
+        try:color=canonical_region_color(region.color)
+        except ValueError:color=None
+        if color is None or color in used:
+            color=next_area_region_color(used)
+            changed=True
+        region.color=color
+        used.append(color)
+    return changed
+
+
+def polygon_encloses_area(points):
+    """Reject retraced outlines whose non-zero winding interior is empty.
+
+    Testing two distinct scanlines in each vertical interval also admits
+    self-intersecting outlines such as a bow tie, whose signed areas cancel.
+    """
+    pts=area_points_array(points)
+    if len(pts)<3 or np.linalg.matrix_rank(pts-pts[0])<2:return False
+    x,y=pts[:,0],pts[:,1]
+    xn,yn=np.roll(x,-1),np.roll(y,-1)
+    levels=np.unique(y)
+    for low,high in zip(levels[:-1],levels[1:]):
+        if high-low <= 1e-10:continue
+        for fraction in (.211324865405187,.788675134594813):
+            row=low+(high-low)*fraction
+            up,down=(y<=row)&(yn>row),(yn<=row)&(y>row)
+            cross=up|down
+            if not cross.any():continue
+            xc=x[cross]+(row-y[cross])*(xn[cross]-x[cross])/(yn[cross]-y[cross])
+            order=np.argsort(xc,kind="stable")
+            winding=np.cumsum(np.where(up[cross],1,-1)[order])
+            if np.any((winding[:-1]!=0)&(np.diff(xc[order])>1e-9)):return True
+    return False
+
+
+def area_spatial_grid(file_path, settings, array_shape, csv_cells=None):
+    """Map retained rows/columns to image pixels, independently of CSV headers.
+
+    The origin is inferred from the original numeric table before user row
+    removal. Thus removing metadata does not masquerade as image cropping.
+    Numeric metadata without labels cannot be distinguished automatically;
+    declared Number X/Y Pixels metadata takes precedence when present.
+    """
+    if csv_cells is None:
+        with open(file_path,"rb") as f:
+            text=f.read().replace(b"\xa0",b" ").decode("utf-8-sig",errors="ignore")
+        cells=[[v.strip() for v in row] for row in csv.reader(io.StringIO(text))]
+        width=max(map(len,cells),default=0)
+        cells=[row+[""]*(width-len(row)) for row in cells]
+    else:
+        cells=csv_cells
+        width=max(map(len,cells),default=0)
+    removed_rows=set(parse_manual_index_list(settings.manual_rows,"Rows to remove"))
+    removed_cols=set(parse_manual_index_list(settings.manual_columns,"Columns to remove"))
+    kept_rows=[i for i in range(len(cells)) if i not in removed_rows]
+    kept_cols=[i for i in range(width) if i not in removed_cols]
+    if (len(kept_rows),len(kept_cols)) != tuple(array_shape):
+        raise ValueError("The loaded array no longer matches its input file and preprocessing. Reload the maps.")
+    declared_x=declared_y=None
+    for row in cells[:30]:
+        if len(row)<2:continue
+        key=re.sub(r"[^a-z]","",row[0].lower())
+        try:value=int(row[1])
+        except ValueError:continue
+        if key in ("numberxpixels","xpixels","columns"):declared_x=value
+        if key in ("numberypixels","ypixels","rows"):declared_y=value
+    def numeric_row(row):
+        count=0
+        for col in kept_cols:
+            value=row[col]
+            if value=="":continue
+            try:float(value)
+            except ValueError:return False
+            count+=1
+        return count>0
+    candidates=[i for i,row in enumerate(cells) if numeric_row(row)]
+    origin_row=candidates[0] if candidates else (min(kept_rows) if kept_rows else 0)
+    if declared_y is not None and 0<declared_y<=len(cells):
+        candidate=len(cells)-declared_y
+        if all(numeric_row(row) or not any(row) for row in cells[candidate:]):origin_row=candidate
+    data_row=cells[origin_row] if origin_row<len(cells) else []
+    origin_col=0
+    # Text row labels are metadata; a numeric index column can be identified
+    # from a declared image width. Otherwise numeric columns are image data.
+    while origin_col<len(data_row):
+        value=data_row[origin_col]
+        try:
+            if value!="":float(value)
+            break
+        except ValueError:origin_col+=1
+    if declared_x is not None and 0<declared_x<=width:
+        origin_col=max(origin_col,width-declared_x)
+    info=area_crop_settings(settings)
+    info.update(shape=list(array_shape),spatial_rows=[i-origin_row for i in kept_rows],
+                spatial_columns=[i-origin_col for i in kept_cols],
+                csv_data_origin=[origin_row,origin_col])
+    if any(i<0 for i in info["spatial_rows"]+info["spatial_columns"]):
+        raise ValueError("Preprocessing still retains header rows or label columns. Remove them before area analysis.")
+    return info
+
+
+def polygon_area_mask_complete(region):
+    pts=area_points_array(region.points)
+    shape=normalize_area_shape(region.shape)
+    if shape in AREA_TWO_POINT_SHAPES:
+        if len(pts)!=2 or np.any(np.abs(pts[1]-pts[0])<=1e-9):return False
+        return shape not in ("Square","Circle") or bool(np.isclose(abs(pts[1,0]-pts[0,0]),abs(pts[1,1]-pts[0,1]),atol=.021))
+    return polygon_encloses_area(pts)
+
+
+def choose_quick_export_path(parent, suggested_name, extension="csv"):
+    state=parent.wizard().state
+    folder=state.output_folder.strip()
+    if not folder and state.selected_file_paths:folder=os.path.dirname(state.selected_file_paths[0])
+    extension=extension.lower()
+    name=sanitize_filename(suggested_name)+"."+extension
+    file_path,_=QFileDialog.getSaveFileName(parent,"Save "+suggested_name,os.path.join(folder,name),
+        "CSV files (*.csv)" if extension=="csv" else "Excel workbook (*.xlsx)" if extension=="xlsx" else "PNG image (*.png);;TIFF image (*.tif);;JPEG image (*.jpg)")
+    if file_path and (not os.path.splitext(file_path)[1] or (extension=="xlsx" and not file_path.lower().endswith(".xlsx"))):file_path+="."+extension
+    return file_path
+
+
+REPORT_IMAGE_DPI = 170
+
+
+def area_report_image(engine, result, output_arrays=None, raw_arrays=None):
+    """Render one matching map/chart pair from an existing result snapshot."""
+    state = copy.deepcopy(engine.state)
+    settings = state.area_analysis_settings
+    settings.base_output_name = result["base_output_name"]
+    settings.selected_output_names = list(result["selected_output_names"])
+    settings.regions = [AreaRegion(name=r["name"], shape=r["shape"], color=r["color"],
+        region_id=r["region_id"], points=copy.deepcopy(r["points"])) for r in result["regions"]]
+    settings.use_processed_values = result["data_basis"] == "Modified values"
+    for key, value in result.get("plot_settings", {}).items():
+        if hasattr(settings, key):
+            setattr(settings, key, value)
+    frozen = ProcessingEngine(state)
+    raw = frozen.load_raw_arrays() if raw_arrays is None else raw_arrays
+    arrays = frozen.prepare_area_arrays(raw) if output_arrays is None else output_arrays
+    bounds = result.get("viewport_bounds")
+    buffer = io.BytesIO()
+    before = set(plt.get_fignums())
+    try:
+        frozen.save_area_analysis_combined_figure(result, arrays, raw, buffer,
+            dpi=REPORT_IMAGE_DPI, pixel_size_um=result["pixel_size_um_per_pixel"],
+            view_bounds=bounds)
+    finally:
+        for number in set(plt.get_fignums()) - before:
+            plt.close(number)
+    scope = result.get("view_scope", "Overview; whole-region statistics")
+    caption = (f"{scope}. Background: {result['base_output_name']}. "
+        f"Regions: {', '.join(r['name'] for r in result['regions']) or 'none'}. "
+        f"Outputs: {', '.join(result['selected_output_names'])}. Data basis: {result['data_basis']}.")
+    return dict(title="Detail map and region comparison" if bounds is not None else "Map and region comparison",
+                caption=caption, png=buffer.getvalue())
+
+
+def output_report_image(engine, name, record):
+    buffer = io.BytesIO()
+    before = set(plt.get_fignums())
+    try:
+        engine.save_map_figure(record["outputs"][name], name,
+            engine.state.display_settings.get(name, OutputDisplaySettings()), buffer, dpi=REPORT_IMAGE_DPI,
+            mask_layers=engine.build_grayscale_mask_layers(record["raw"], output_name=name),
+            add_scale_bar=engine.state.scale_bar_settings.enabled,
+            pixel_size_um=engine.get_pixel_size_um_for_output(name) if engine.state.scale_bar_settings.enabled else None)
+    finally:
+        for number in set(plt.get_fignums()) - before:
+            plt.close(number)
+    return dict(png=buffer.getvalue(), caption=f"{name}. Map after scaling and numerical processing, with the selected colour scale and display masks.")
+
+
+def line_report_image(engine, record):
+    settings = engine.state.line_profile_settings
+    # A background such as Grey can be loaded without being selected for export.
+    arrays = dict(record["working"])
+    arrays.update(record["outputs"])
+    profile = engine.extract_line_profile_data(arrays, settings.base_output_name,
+        settings.selected_output_names, settings.start_x, settings.start_y, settings.end_x,
+        settings.end_y, settings.normalize_mode)
+    buffer = io.BytesIO()
+    before = set(plt.get_fignums())
+    try:
+        engine.save_line_profile_combined_figure(profile, arrays, record["raw"], buffer,
+            dpi=REPORT_IMAGE_DPI, add_scale_bar=engine.state.scale_bar_settings.enabled,
+            pixel_size_um=engine.get_pixel_size_um_for_output(settings.base_output_name)
+                if engine.state.scale_bar_settings.enabled else None)
+    finally:
+        for number in set(plt.get_fignums()) - before:
+            plt.close(number)
+    return dict(png=buffer.getvalue(), caption=f"Line drawn on {settings.base_output_name} and its profile. "
+        f"Outputs: {', '.join(settings.selected_output_names)}. Values: {settings.normalize_mode}.")
+
+
+def add_excel_report_images(workbook, figures, scope):
+    from openpyxl.drawing.image import Image as ExcelImage
+    from openpyxl.styles import Alignment, Font, PatternFill
+    sheet = workbook.create_sheet("Figures")
+    sheet.sheet_view.showGridLines = False
+    for letter in "ABCDEFGHIJKLMNOP":
+        sheet.column_dimensions[letter].width = 10
+    sheet.merge_cells("A1:P1")
+    cell = sheet["A1"]
+    cell.value = "Maps and comparison charts"
+    cell.font = Font(name="Arial", size=16, bold=True, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor="20334B")
+    sheet.row_dimensions[1].height = 32
+    sheet.merge_cells("A2:P2")
+    sheet["A2"] = scope
+    sheet["A2"].font = Font(name="Arial", size=10)
+    sheet.row_dimensions[2].height = 24
+    row = 4
+    for figure in figures:
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=16)
+        cell = sheet.cell(row, 1, figure["title"])
+        cell.font = Font(name="Arial", size=12, bold=True)
+        sheet.row_dimensions[row].height = 25
+        sheet.merge_cells(start_row=row+1, start_column=1, end_row=row+1, end_column=16)
+        cell = sheet.cell(row+1, 1, figure["caption"])
+        cell.data_type = "s"
+        cell.font = Font(name="Arial", size=10)
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        sheet.row_dimensions[row+1].height = max(32, 14 * (len(figure["caption"]) // 135 + 1))
+        image = ExcelImage(io.BytesIO(figure["png"]))
+        scale = min(1.0, 1080 / image.width)
+        image.width, image.height = image.width * scale, image.height * scale
+        sheet.add_image(image, f"A{row+2}")
+        row += 4 + int(np.ceil(image.height / 20))
+
+
+
+def write_area_excel_report(result, save_path, project_snapshot, figures=None):
+    """Export the current chart's existing statistics, without reprocessing maps.
+
+    The grouped comparison and workbook formatting follow the reporting approach
+    used in Plasmatti; the values and scientific definitions are Elementti's.
+    openpyxl is imported only when an Excel report is requested.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError(
+            "Excel reports require openpyxl. Install it in the Python environment "
+            "used to run Elementti:\n\npython -m pip install openpyxl"
+        ) from exc
+
+    names = list(result.get("selected_output_names", []))
+    regions = result.get("regions", [])
+    if not names or not regions:
+        raise ValueError("An Excel report needs at least one displayed output and one region.")
+    if 2 + 2 * len(names) > 16384:
+        raise ValueError("This comparison exceeds Excel's column limit. Select fewer outputs.")
+    if len(names) * len(regions) + 6 > 1048576:
+        raise ValueError("This report exceeds Excel's row limit. Export fewer regions or outputs.")
+    for region in regions:
+        for name in names:
+            if name not in region.get("stats", {}):
+                raise ValueError(f"The result for '{name}' in '{region['name']}' is unavailable.")
+
+    wb = Workbook()
+    summary = wb.active
+    summary.title = "Region comparison"
+    details = wb.create_sheet("Detailed statistics")
+    settings = wb.create_sheet("Analysis settings")
+    navy, pale, ink = "20334B", "E8F1FB", "172B42"
+    thin = Side(style="thin", color="D8E1EC")
+    font = Font(name="Arial", size=10, color=ink)
+    scope = result.get("view_scope", "Overview; whole-region statistics")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    project_name = project_snapshot.get("output_options", {}).get("project_name", "").strip()
+    wb.properties.creator = APP_NAME
+    wb.properties.title = (project_name + " — " if project_name else "") + "Region composition report"
+    wb.properties.description = f"{APP_NAME} {APP_VERSION}; {scope}; {result['data_basis']}."
+
+    def put(ws, row, col, value):
+        if row > 1048576:
+            raise ValueError("Region outlines exceed Excel's row limit. Export fewer regions.")
+        cell = ws.cell(row, col)
+        if isinstance(value, (np.bool_, bool)):
+            value = bool(value)
+        elif isinstance(value, (np.integer, int)):
+            value = int(value)
+        elif isinstance(value, (np.floating, float)):
+            value = float(value) if np.isfinite(value) else None
+        if value is None:
+            value = "n/a"
+        if isinstance(value, str):
+            value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+            if len(value) > 32767:
+                raise ValueError("A report field exceeds Excel's text limit. Shorten its name or value.")
+            cell.value = value
+            cell.data_type = "s"  # Names and expressions remain literal text, including leading '='.
+        else:
+            cell.value = value
+        cell.font = font
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+        if value == "n/a":
+            cell.alignment = Alignment(horizontal="right", vertical="center", indent=1)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            cell.alignment = Alignment(horizontal="right", vertical="center", indent=1)
+            cell.number_format = ("0" if isinstance(value, int) else
+                "0.0000E+00" if value != 0 and (abs(value) < .001 or abs(value) >= 1e6) else "0.0000")
+        return cell
+
+    def banner(ws, title, width):
+        ws.sheet_view.showGridLines = False
+        ws.sheet_properties.pageSetUpPr.fitToPage = False
+        ws.page_setup.orientation = "landscape"
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=width)
+        for col in range(1, width + 1):
+            ws.cell(1, col).fill = PatternFill("solid", fgColor=navy)
+        cell = put(ws, 1, 1, title)
+        cell.font = Font(name="Arial", size=16, bold=True, color="FFFFFF")
+        ws.row_dimensions[1].height = 32
+
+    def note(ws, row, text, width, height=30):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=width)
+        put(ws, row, 1, text)
+        ws.row_dimensions[row].height = height
+
+    def header(ws, row, labels):
+        for col, label in enumerate(labels, 1):
+            cell = put(ws, row, col, label)
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = Border(bottom=thin)
+        ws.row_dimensions[row].height = 42
+
+    def record(ws, row, values):
+        for col, value in enumerate(values, 1):
+            cell = put(ws, row, col, value)
+            cell.border = Border(bottom=thin)
+            if row % 2:
+                cell.fill = PatternFill("solid", fgColor="F3F6FA")
+        ws.row_dimensions[row].height = 30
+
+    def region_marker(cell, region):
+        rgb = to_rgb(region["color"])
+        exact = "".join(f"{round(channel * 255):02X}" for channel in rgb)
+        tint = "".join(f"{round((.88 + .12 * channel) * 255):02X}" for channel in rgb)
+        cell.fill = PatternFill("solid", fgColor=tint)
+        cell.border = Border(left=Side(style="medium", color=exact), bottom=thin)
+        cell.font = Font(name="Arial", size=10, bold=True, color=ink)
+
+    # A compact comparison: one row per region, paired value/spatial-SD columns
+    # for each displayed output, with that output's own unit in the group header.
+    end = 2 + 2 * len(names)
+    banner(summary, wb.properties.title, end)
+    note(summary, 2, f"{APP_NAME} {APP_VERSION}  |  {stamp}  |  {scope}", end)
+    note(summary, 3, f"Background: {result['base_output_name']}  |  Data basis: {result['data_basis']}  |  "
+         f"Shared valid pixels: {'Yes' if result['common_pixels'] else 'No'}", end)
+    note(summary, 4, "Normalized to 100% over: " + ", ".join(result["normalization_names"])
+         if result["normalization_names"] else "Normalization to 100%: off.", end)
+    note(summary, 5, "Values match the chart, including ratio-of-means and normalized means. SD describes spatial variation, "
+         "not measurement uncertainty; scaled spatial SD uses the normalization total as a fixed factor. "
+         "n/a means unavailable, not zero.", end, 45)
+    note(summary, 6, "Detail exports retain complete-region statistics, including pixels outside the viewport."
+         if "Detail" in scope else "Selected pixels count the full drawn region; used pixel counts are in Detailed statistics.", end)
+    header(summary, 7, ["Region", "Selected pixels"] + [""] * (end - 2))
+    header(summary, 8, ["", ""] + [""] * (end - 2))
+    summary.merge_cells("A7:A8")
+    summary.merge_cells("B7:B8")
+    for i, name in enumerate(names):
+        col = 3 + 2 * i
+        entry = regions[0]["stats"][name]
+        summary.merge_cells(start_row=7, start_column=col, end_row=7, end_column=col + 1)
+        group = put(summary, 7, col, f"{name} ({entry['display_unit']})")
+        group.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        group.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        value_label = {"mean": "Mean", "normalised mean": "Relative mean", "ratio of means": "Ratio of means"}.get(entry["value_kind"], "Value")
+        for offset, label in enumerate((value_label, "Scaled spatial SD" if name in result["normalization_names"] else "Spatial SD")):
+            cell = put(summary, 8, col + offset, label)
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row, region in enumerate(regions, 9):
+        values = [region["name"], region["pixels"]]
+        for name in names:
+            entry = region["stats"][name]
+            values.extend([entry["value"], entry["value_sd"]])
+        record(summary, row, values)
+        region_marker(summary.cell(row, 1), region)
+    summary.column_dimensions["A"].width = 28
+    summary.column_dimensions["B"].width = 18
+    for col in range(3, end + 1):
+        summary.column_dimensions[get_column_letter(col)].width = 20
+    summary.freeze_panes = "C9"
+    summary.print_title_rows = "1:8"
+    summary.print_area = f"A1:{get_column_letter(end)}{summary.max_row}"
+
+    # One flat, filterable record for each region/output; raw statistics and
+    # plotted statistics remain separate, especially for ratios and normalization.
+    labels = ["Region", "Output", "Displayed unit", "Displayed value", "Displayed kind", "Displayed spatial SD",
+        "Displayed pixels used", "Input unit", "Mean", "Sample SD", "Median", "Minimum", "Maximum",
+        "Pixel-statistics pixels used", "Pixels in region", "Masked pixels left out", "Empty / nonfinite pixels",
+        "Undefined pixel ratios", "Ratio of means", "Ratio-of-means pixels used", "Relative mean (%)",
+        "Scaled spatial SD", "Selected area (µm²)", "Pixel-statistics area (µm²)", "Displayed used area (µm²)",
+        "Region shape", "Region color", "Region ID"]
+    banner(details, "Detailed region statistics", 8)
+    note(details, 2, scope + "  |  " + result["data_basis"], 8)
+    note(details, 3, "Mean, sample SD, median, minimum and maximum describe finite pixel values. For ratios these are pixel-ratio "
+         "statistics; the chart displays the separate ratio of region means.", 8, 35)
+    note(details, 4, "SD uses n−1 and is unavailable below two pixels. It describes spatial variation. Real zeros are included. "
+         "Physical areas require calibration; n/a indicates unavailable values.", 8, 35)
+    header(details, 6, labels)
+    row = 7
+    for region in regions:
+        for name in names:
+            e = region["stats"][name]
+            record(details, row, [region["name"], name, e["display_unit"], e["value"], e["value_kind"], e["value_sd"],
+                e["display_pixels_used"], e["unit"], e["mean"], e["sd"], e["median"], e["min"], e["max"], e["pixels_used"],
+                region["pixels"], e["pixels_masked"], e["pixels_empty"], e["pixels_undefined"], e["ratio_of_means"],
+                e["ratio_pixels_used"], e["normalized"], e["normalized_sd"], region["area_um2"], e["used_area_um2"],
+                e["display_area_um2"], region["shape"], region["color"], region["region_id"]])
+            region_marker(details.cell(row, 1), region)
+            row += 1
+    for col in range(1, len(labels) + 1):
+        details.column_dimensions[get_column_letter(col)].width = 24 if col in (1, 2, 3, 5, 8, 28) else 20
+    details.freeze_panes = "C7"
+    details.auto_filter.ref = f"A6:AB{details.max_row}"
+    details.print_title_rows = "1:6"
+
+    banner(settings, "Analysis settings and source records", 4)
+    note(settings, 2, f"{APP_NAME} {APP_VERSION}  |  {stamp}  |  {scope}", 4)
+    note(settings, 3, "This is a saved snapshot. Changing cells does not rerun Elementti. The source records and processing settings "
+         "below explain the exported values.", 4, 35)
+    note(settings, 4, "Region coordinates use the original map's pixel coordinates. Two-corner shapes store opposite corners; "
+         "polygon and freehand shapes store every outline point in order.", 4, 35)
+    header(settings, 6, ["Section", "Setting", "Value / X", "Explanation / Y"])
+    row = 7
+
+    def setting(section, key, value, explanation=""):
+        nonlocal row
+        if isinstance(value, (bool, np.bool_)):
+            value = "Yes" if value else "No"
+        record(settings, row, [section, key, value, explanation])
+        row += 1
+
+    for key, value in [("Project", project_name or "Untitled"), ("Version", APP_VERSION), ("Generated", stamp),
+            ("View scope", scope), ("Background", result["base_output_name"]), ("Data basis", result["data_basis"]),
+            ("Rows", result["array_shape"][0]), ("Columns", result["array_shape"][1]),
+            ("Pixel size (µm/pixel)", result["pixel_size_um_per_pixel"]), ("Shared valid pixels", result["common_pixels"]),
+            ("Exclude masked pixels", result["exclude_masked"]), ("Excluded mask pixels present", result["masking_active"]),
+            ("Normalize to 100%", result["normalize_to_100"]), ("Region selection", result.get("region_selection", "All regions"))]:
+        setting("Report", key, value)
+    for key, value in zip(("View X minimum", "View X maximum", "View Y minimum", "View Y maximum"), result.get("viewport_bounds", [])):
+        setting("Detail viewport", key, value, "View only; complete regions are used for statistics.")
+    for i, name in enumerate(names, 1):
+        setting("Displayed outputs", str(i), name, result["units"][name]["unit"])
+        unit = result["units"][name]
+        if unit.get("warning"):
+            setting("Unit notes", name, unit["warning"])
+    for file in project_snapshot.get("files", []):
+        section = "Source: " + (file.get("name") or file["file_name"])
+        setting(section, "File", file["file_name"], file["path"])
+        for key, value in file.get("settings", {}).items():
+            setting(section, key.replace("_", " ").capitalize(), value)
+
+    def flatten(section, value, key=""):
+        if isinstance(value, dict):
+            for child, item in value.items():
+                flatten(section, item, (key + " / " if key else "") + str(child).replace("_", " "))
+        elif isinstance(value, list):
+            if not value:
+                setting(section, key, "None")
+            for i, item in enumerate(value, 1):
+                flatten(section, item, f"{key} / {i}")
+        else:
+            setting(section, key, value)
+
+    provenance = project_snapshot.get("source_provenance", {})
+    setting("Source verification", "Dataset mode", source_mode_label(provenance.get("mode", "new")))
+    setting("Source verification", "Dataset ID", provenance.get("dataset_id", "Not recorded"))
+    for source_record in project_snapshot.get("source_manifest", []):
+        section = "Fingerprint: " + source_record.get("name", source_record.get("file_name", ""))
+        fingerprint_labels = {"file_name":"File", "sha256":"SHA-256", "size_bytes":"Bytes read",
+            "loaded_utc":"Read at (UTC)", "verification":"Verification", "baseline_kind":"Baseline origin"}
+        for key in ("file_name", "sha256", "size_bytes", "loaded_utc", "verification", "baseline_kind"):
+            setting(section, fingerprint_labels[key], source_record.get(key, "Not recorded"))
+    for i, event in enumerate(provenance.get("decisions", []), 1):
+        decision_labels = {"action":"Decision", "time_utc":"Recorded at (UTC)", "map":"Map", "file":"Current file",
+            "previous_file":"Previous file", "previous_sha256":"Previous SHA-256", "current_sha256":"Current SHA-256",
+            "reason":"Reason", "project":"Source project"}
+        for key, value in event.items():
+            setting(f"Source decision {i}", decision_labels.get(key,key.replace("_", " ")),
+                value.replace("_", " ").capitalize() if key=="action" and isinstance(value,str) else value)
+    flatten("Processing configuration", project_snapshot.get("masking_and_noise_settings", {}))
+    flatten("Chart settings", result.get("plot_settings", {}))
+    for ratio in project_snapshot.get("selected_ratios", []):
+        name = f"{ratio['numerator']} / {ratio['denominator']}"
+        if name in names:
+            setting("Derived outputs", name, "Ratio of region means", "Pixel-ratio statistics are recorded separately.")
+    for formula in project_snapshot.get("selected_formulas", []):
+        if formula["name"] in names:
+            setting("Derived outputs", formula["name"], formula["expression"], "Formula evaluated on the chosen data basis before averaging.")
+    for region in regions:
+        section = "Region: " + region["name"]
+        for key in ("region_id", "shape", "color", "pixels", "area_um2", "x_min", "x_max", "y_min", "y_max"):
+            setting(section, key.replace("_", " "), region[key])
+        for i, (x, y) in enumerate(region["points"], 1):
+            setting(section, f"Outline point {i} (X, Y)", x, y)
+    setting("Interpretation", "SD", "Sample SD describes spatial variation, not measurement uncertainty.")
+    setting("Interpretation", "Relative composition", "Proportions of the selected quantified elements only; rescaled to 100%.")
+    setting("Interpretation", "Area result", "Map averages; not quantification of a summed EDS spectrum.")
+    setting("Citation", "Elementti", APP_CITATION_TEXT)
+    for col, width in zip("ABCD", (32, 38, 52, 72)):
+        settings.column_dimensions[col].width = width
+    # Source paths and scientific notes need more room than numerical records.
+    for row_index in range(7, settings.max_row + 1):
+        longest = max(len(str(settings.cell(row_index, col).value or "")) / width
+                      for col, width in ((1, 32), (2, 38), (3, 52), (4, 72)))
+        settings.row_dimensions[row_index].height = max(30, 15 * (int(longest) + 1))
+    settings.freeze_panes = "C7"
+    settings.auto_filter.ref = f"A6:D{settings.max_row}"
+    settings.print_title_rows = "1:6"
+    if figures:
+        add_excel_report_images(wb, figures, scope)
+    for ws in wb:
+        ws.sheet_properties.tabColor = navy
+        ws.sheet_view.zoomScale = 90
+    # An interrupted write must not truncate an existing report.
+    destination = os.path.abspath(os.fspath(save_path))
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".elementti_report_", suffix=".xlsx", dir=os.path.dirname(destination))
+        os.close(descriptor)
+        wb.save(temporary)
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        wb.close()
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    return destination
+
+
+def run_quick_export(parent, stem, extension, write_file):
+    path=choose_quick_export_path(parent,stem,extension)
+    if not path:return False
+    try:write_file(path)
+    except Exception as exc:
+        QMessageBox.warning(parent,"Export failed",str(exc))
+        return False
+    label=getattr(parent,"status_label",None) or getattr(parent,"quick_export_status",None)
+    if label is not None:label.setText("Saved: "+os.path.basename(path))
+    return True
+
+def next_area_region_color(used_colors):
+    used=set()
+    for color in used_colors:
+        try:used.add(canonical_region_color(color))
+        except ValueError:pass
+    for color in DEFAULT_AREA_REGION_COLORS:
+        value=canonical_region_color(color)
+        if value not in used:return value
+    # New hues continue beyond the initial palette; equivalent names/hex codes
+    # are compared in one canonical representation rather than as raw strings.
+    for index in range(1,100000):
+        rgb=colorsys.hsv_to_rgb((index*.618033988749895)%1,.65+.1*(index%3),.65+.14*(index%3))
+        value=canonical_region_color(rgb)
+        if value not in used:return value
+    raise ValueError("No unused region colour is available.")
+
+
 @dataclass
 class LowValueRule:
     enabled: bool = False
@@ -1752,6 +2849,12 @@ class FormulaOutput:
 @dataclass
 class AppState:
     selected_file_paths: List[str] = field(default_factory=list)
+    acquisition_reference_path: str = ""
+    source_fingerprints: Dict[str, dict] = field(default_factory=dict)
+    loaded_source_fingerprints: Dict[str, dict] = field(default_factory=dict)
+    source_decisions: List[dict] = field(default_factory=list)
+    source_mode: str = "new"
+    source_dataset_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     renamed_names_by_path: Dict[str, str] = field(default_factory=dict)
     selected_maps: List[str] = field(default_factory=list)
     selected_ratios: List[Tuple[str, str]] = field(default_factory=list)
@@ -1760,12 +2863,14 @@ class AppState:
     processed_min_max_by_name: Dict[str, Tuple[Optional[float], Optional[float]]] = field(default_factory=dict)
     display_settings: Dict[str, OutputDisplaySettings] = field(default_factory=dict)
     line_profile_settings: LineProfileSettings = field(default_factory=LineProfileSettings)
+    area_analysis_settings: AreaAnalysisSettings = field(default_factory=AreaAnalysisSettings)
     masking_and_noise_settings: MaskingAndNoiseSettings = field(default_factory=MaskingAndNoiseSettings)
     scale_bar_settings: ScaleBarSettings = field(default_factory=ScaleBarSettings)
     output_folder: str = ""
     project_name: str = ""
     save_png: bool = True
     save_csv: bool = True
+    save_word: bool = True
     figure_format: str = "png"
     figure_dpi: int = 300
     sample_data_folder: str = ""
@@ -1799,9 +2904,13 @@ class AppState:
         self.display_settings.clear()
         self.processed_min_max_by_name.clear()
         self.reset_line_profile_settings()
+        self.reset_area_analysis_settings()
 
     def reset_line_profile_settings(self) -> None:
-        self.line_profile_settings = LineProfileSettings()
+        self.line_profile_settings = LineProfileSettings(base_output_name=self.renamed_names_by_path.get(self.acquisition_reference_path, ""))
+
+    def reset_area_analysis_settings(self) -> None:
+        self.area_analysis_settings = AreaAnalysisSettings(base_output_name=self.renamed_names_by_path.get(self.acquisition_reference_path, ""))
 
     def reset_masking_settings(self) -> None:
         self.masking_and_noise_settings = MaskingAndNoiseSettings()
@@ -1810,6 +2919,18 @@ class AppState:
         self.scale_bar_settings = ScaleBarSettings()
 
     def reset_all_dependent_settings(self) -> None:
+        active = {source_key(path) for path in self.selected_file_paths}
+        previous = set(self.source_fingerprints)
+        self.source_fingerprints = {key:value for key,value in self.source_fingerprints.items() if key in active}
+        self.loaded_source_fingerprints = {key:value for key,value in self.loaded_source_fingerprints.items() if key in active}
+        if not active or (previous and not previous.intersection(active)):
+            self.source_mode = "new"
+            self.source_dataset_id = uuid.uuid4().hex
+            self.source_decisions = []
+        elif previous and previous != active:
+            self.source_decisions.append(dict(action="input_selection_changed", time_utc=source_time(),
+                reason="The selected input files changed and dependent analysis settings were reset."))
+            if self.source_mode == "original":self.source_mode = "reviewed"
         self.reset_outputs_and_display()
         self.reset_masking_settings()
         self.reset_scale_bar_settings()
@@ -1831,6 +2952,21 @@ class AppState:
             if name in allowed
         }
         self.prune_line_profile_settings_to_current_outputs()
+        self.prune_area_analysis_settings_to_current_outputs()
+
+    def prune_area_analysis_settings_to_current_outputs(self) -> None:
+        allowed_outputs = set(self.get_output_names()) | set(self.get_ordered_names())
+        allowed_base = allowed_outputs | set(self.get_ordered_names())
+        aa = self.area_analysis_settings
+        if aa.base_output_name not in allowed_base:
+            # The regions are kept: the page checks them against the size of the new background.
+            # A greyscale image is the easiest background for drawing regions, when there is one.
+            candidates = self.get_ordered_names() + self.get_output_names()
+            aa.base_output_name = next(
+                (name for name in candidates if is_grayscale_name(name)),
+                next(iter(candidates), ""),
+            )
+        aa.selected_output_names = [name for name in aa.selected_output_names if name in allowed_outputs]
 
     def prune_line_profile_settings_to_current_outputs(self) -> None:
         allowed_curves = set(self.get_output_names())
@@ -1852,16 +2988,240 @@ class AppState:
         }
 
 
+class SourceVerificationError(ValueError):
+    """An input no longer matches the source accepted for this analysis."""
+
+
+def source_key(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def source_time():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def declared_source_type(raw):
+    try:
+        text = raw[:65536].replace(b"\xa0", b" ").decode("utf-8-sig", errors="ignore")
+        for index, row in enumerate(csv.reader(io.StringIO(text))):
+            if index >= 20:break
+            if len(row) > 1 and row[0].strip().lower() == "data type":
+                return row[1].strip()
+    except csv.Error:
+        pass
+    return ""
+
+
+def source_type_for_display(state, path):
+    loaded = state.loaded_source_fingerprints.get(source_key(path), {})
+    return loaded["data_type"] if "data_type" in loaded else area_data_type(path)
+
+
+def valid_source_identity(identity):
+    return (isinstance(identity, dict)
+        and isinstance(identity.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", identity["sha256"]) is not None
+        and isinstance(identity.get("size_bytes"), int)
+        and not isinstance(identity["size_bytes"], bool) and identity["size_bytes"] >= 0)
+
+
+def fingerprint_source_file(path):
+    """Read file contents rather than trusting names, size or modification time."""
+    digest = hashlib.sha256()
+    length = 0
+    with open(path, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+            length += len(chunk)
+        after = os.fstat(stream.fileno())
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or length != after.st_size:
+        raise SourceVerificationError("The file changed while it was being checked. Wait for writing to finish and check it again.")
+    return dict(sha256=digest.hexdigest(), size_bytes=length, checked_utc=source_time())
+
+
+def inspect_source_files(entries, paths=None):
+    """Compare saved identities with current files; never adopt changed data."""
+    if paths is None:
+        paths = [entry.get("path", "") for entry in entries]
+    if len(paths) != len(entries):
+        raise ValueError("Every saved map needs one current file.")
+    rows = []
+    for entry, path in zip(entries, paths):
+        expected = entry.get("source_identity")
+        row = dict(name=entry.get("name", ""), path=os.fspath(path),
+            saved_path=entry.get("path", ""), saved_file=entry.get("file_name", ""),
+            expected=copy.deepcopy(expected), current=None, message="")
+        try:
+            current = fingerprint_source_file(path)
+            row["current"] = current
+            row["status"] = ("Unverified" if not valid_source_identity(expected) else
+                "Unchanged" if current["sha256"] == expected["sha256"].lower()
+                    and current["size_bytes"] == expected["size_bytes"] else "Changed")
+            if row["status"] == "Unverified":
+                row["message"] = "No saved fingerprint; the original file contents cannot be verified."
+            elif row["status"] == "Changed":
+                row["message"] = "The file contents differ from the accepted fingerprint."
+        except FileNotFoundError:
+            row.update(status="Missing", message="The current file could not be found.")
+        except (OSError, SourceVerificationError) as exc:
+            row.update(status="Unreadable", message=str(exc))
+        rows.append(row)
+    return rows
+
+
+def source_entries(state):
+    return [dict(name=state.renamed_names_by_path.get(path, ""), file_name=os.path.basename(path),
+        path=path, source_identity=copy.deepcopy(state.source_fingerprints.get(source_key(path))))
+        for path in state.selected_file_paths]
+
+
+def accept_reviewed_sources(state, rows, reason, template=False, project_name=""):
+    """Record an explicit review, ensuring files still match what was displayed."""
+    if not rows or any(row["status"] in ("Missing", "Unreadable") for row in rows):
+        raise SourceVerificationError("Locate all missing or unreadable files before accepting this source selection.")
+    current_rows = inspect_source_files([
+        dict(name=row["name"], path=row["path"], file_name=os.path.basename(row["path"])) for row in rows])
+    if any(a["current"] is None or a["current"]["sha256"] != b["current"]["sha256"]
+           for a, b in zip(current_rows, rows)):
+        raise SourceVerificationError("A file changed while the review was open. Review the source files again.")
+    fingerprints = copy.deepcopy(state.source_fingerprints)
+    decisions = [] if template else copy.deepcopy(state.source_decisions)
+    stamp = source_time()
+    for row in rows:
+        key = source_key(row["path"])
+        expected = row["expected"]
+        current = copy.deepcopy(row["current"])
+        changed = row["status"] in ("Changed", "Unverified")
+        if template or changed:
+            legacy = row["status"] == "Unverified" and state.source_mode == "legacy"
+            kind = "New dataset" if template else ("Legacy baseline" if legacy else "Initial import") if row["status"] == "Unverified" else "Accepted replacement"
+            current.update(recorded_utc=stamp, baseline_kind=kind)
+            fingerprints[key] = current
+            decisions.append(dict(action="template_source_selected" if template else
+                    ("legacy_baseline_created" if legacy else "source_baseline_created") if row["status"] == "Unverified" else "source_replacement_accepted",
+                time_utc=stamp, map=row["name"], file=os.path.basename(row["path"]),
+                previous_file=row["saved_file"], previous_sha256=expected.get("sha256") if isinstance(expected, dict) else None,
+                current_sha256=current["sha256"], reason=reason, project=project_name))
+        elif source_key(row["path"]) != source_key(row["saved_path"] or row["path"]):
+            decisions.append(dict(action="source_relocated", time_utc=stamp, map=row["name"],
+                file=os.path.basename(row["path"]), previous_file=row["saved_file"],
+                previous_sha256=expected["sha256"], current_sha256=current["sha256"],
+                reason="File location changed; the content fingerprint is unchanged.", project=project_name))
+    state.source_fingerprints = fingerprints
+    state.source_decisions = decisions
+    state.loaded_source_fingerprints = {}
+    if template:
+        state.source_mode = "template"
+        state.source_dataset_id = uuid.uuid4().hex
+    elif any(row["status"] == "Changed" for row in rows):
+        state.source_mode = "reviewed"
+    elif state.source_mode == "legacy" and any(row["status"] == "Unverified" for row in rows):
+        state.source_mode = "legacy"
+
+
+def bind_source_bytes(state, path, raw):
+    """The digest is computed from the exact bytes passed to the CSV parser."""
+    key = source_key(path)
+    identity = dict(sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw), data_type=declared_source_type(raw))
+    expected = state.source_fingerprints.get(key)
+    if expected is not None:
+        if not valid_source_identity(expected):
+            raise SourceVerificationError("This input has an invalid saved fingerprint. Open Files and choose Review source files.")
+        if identity["sha256"] != expected["sha256"].lower() or identity["size_bytes"] != expected["size_bytes"]:
+            raise SourceVerificationError(
+                f"The contents of '{os.path.basename(path)}' have changed since they were accepted for this analysis.\n\n"
+                "Open step 1 (Files), choose Review source files, and review the change before continuing.")
+    stamp = source_time()
+    if expected is None:
+        expected = dict(identity, recorded_utc=stamp, baseline_kind="Initial import")
+        state.source_fingerprints[key] = expected
+        verification = "First read"
+    else:
+        verification = {"original": "Matched saved fingerprint", "template": "New dataset baseline",
+            "reviewed": "Matched reviewed baseline", "legacy": "Legacy baseline; original unverified"}.get(
+                state.source_mode, "Matched current-session baseline")
+    state.loaded_source_fingerprints[key] = dict(identity, loaded_utc=stamp,
+        verification=verification, baseline_kind=expected.get("baseline_kind", "Saved fingerprint"))
+
+
+def source_manifest(state):
+    records = []
+    for path in state.selected_file_paths:
+        key = source_key(path)
+        loaded = state.loaded_source_fingerprints.get(key)
+        baseline = state.source_fingerprints.get(key, {})
+        record = dict(loaded or baseline)
+        record.update(name=state.renamed_names_by_path.get(path, ""),
+            file_name=os.path.basename(path), path=os.path.abspath(path))
+        if loaded is None:
+            record["verification"] = "Not read in this session"
+        records.append(record)
+    return records
+
+
+def source_mode_label(mode):
+    return {"new": "New analysis", "original": "Reopened saved analysis", "template": "New dataset using saved settings",
+        "reviewed": "Changed sources explicitly reviewed", "legacy": "Legacy project; original file identity unverified"}.get(mode, mode)
+
+
+def write_project_file(state, path):
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".elementti_project_", suffix=".json", dir=os.path.dirname(os.path.abspath(path)))
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(project_dict(state), stream, indent=2, ensure_ascii=False, allow_nan=False)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:os.unlink(temporary)
+            except OSError:pass
+
+
+def write_source_provenance_docx(doc, engine):
+    state = engine.state
+    doc.heading(2, "Source file verification")
+    doc.para("Dataset mode: " + source_mode_label(state.source_mode) + ".")
+    doc.para("Dataset ID: " + state.source_dataset_id)
+    rows = [["Map", "Source file", "Verification", "Bytes read"]]
+    records = source_manifest(state)
+    for source in records:
+        rows.append([source["name"], source["file_name"], source["verification"], str(source.get("size_bytes", "not recorded"))])
+    doc.table(rows, [1000, 3300, 3600, 1800])
+    for source in records:
+        doc.para(source["name"] + " — SHA-256", keep_next=True)
+        doc.para(_dx_run(source.get("sha256", "Not recorded"), font="Consolas", size=16), keep_next=bool(source.get("loaded_utc")))
+        if source.get("loaded_utc"):
+            doc.para("Read at " + source["loaded_utc"])
+    if state.source_decisions:
+        doc.heading(2, "Source decisions")
+        for event in state.source_decisions:
+            doc.para(f"{event.get('time_utc', '')}: {event.get('action', '').replace('_', ' ')} — "
+                     f"{event.get('map', '')}, {event.get('file', '')}.", keep_next=True)
+            doc.para(event.get("reason", ""), keep_next=bool(event.get("previous_sha256") or event.get("current_sha256")))
+            if event.get("previous_sha256"):
+                doc.para(_dx_run("Previous SHA-256: " + event["previous_sha256"], font="Consolas", size=16), keep_next=bool(event.get("current_sha256")))
+            if event.get("current_sha256"):
+                doc.para(_dx_run("Current SHA-256: " + event["current_sha256"], font="Consolas", size=16))
+
+
+
 class ProcessingEngine:
     def __init__(self, state: AppState):
         self.state = state
 
     def read_csv_cells(self, file_path: str) -> List[List[str]]:
         with open(file_path, "rb") as f:
+            before = os.fstat(f.fileno())
             raw = f.read()
+            after = os.fstat(f.fileno())
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(raw) != after.st_size:
+            raise SourceVerificationError("A source file changed during reading. Wait for writing to finish and reload the maps.")
+        bind_source_bytes(self.state, file_path, raw)
 
         raw = raw.replace(b"\xa0", b" ")
-        text = raw.decode("utf-8", errors="ignore")
+        text = raw.decode("utf-8-sig", errors="ignore")
 
         reader = csv.reader(io.StringIO(text))
         rows = [[cell.strip() for cell in row] for row in reader]
@@ -2447,6 +3807,8 @@ class ProcessingEngine:
         with open(save_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["normalization_mode", normalize_mode])
+            writer.writerow(["data_basis", "Modified values after numerical processing rules"])
+            for name in selected_output_names:writer.writerow(["unit:"+name,self.area_output_units(name)["unit"]])
             writer.writerow(["distance_axis", profile_data.get("distance_axis_label", "Distance along line (pixels)")])
             if profile_data.get("pixel_size_um_per_pixel") is not None:
                 writer.writerow(["pixel_size_um_per_pixel", profile_data.get("pixel_size_um_per_pixel")])
@@ -2963,7 +4325,7 @@ class ProcessingEngine:
                 else:
                     divider = make_axes_locatable(ax)
                     cax = divider.append_axes(side, size="4%", pad=0.05)
-                cbar = plt.colorbar(im, cax=cax)
+                cbar = ax.figure.colorbar(im, cax=cax)
                 set_colorbar_clipping_endpoint_labels(
                     cbar,
                     vmin,
@@ -2999,7 +4361,7 @@ class ProcessingEngine:
                 else:
                     divider = make_axes_locatable(ax)
                     cax = divider.append_axes(side, size="4%", pad=0.05)
-                cbar = plt.colorbar(im, cax=cax)
+                cbar = ax.figure.colorbar(im, cax=cax)
                 cbar.set_ticks(boundaries)
                 if boundaries:
                     set_colorbar_clipping_endpoint_labels(
@@ -3164,6 +4526,764 @@ class ProcessingEngine:
             right_profile_ax = getattr(ax_profile, "_elementti_right_axis", None)
             if right_profile_ax is not None:
                 right_profile_ax.set_position(new_profile_position)
+        except Exception:
+            pass
+
+        fig.savefig(save_path, bbox_inches="tight", dpi=dpi)
+        plt.close(fig)
+
+    # --- area analysis (Elementti 1.1.1) -------------------------------------
+
+    def area_source_grid(self, name, array_shape, settings_override=None):
+        path=self.state.get_named_files()[name]
+        settings=settings_override or self.state.file_processing_settings[path]
+        stat=os.stat(path)
+        grid_key=(path,stat.st_mtime_ns,stat.st_size,settings.manual_rows,settings.manual_columns,settings.pixel_size_um,tuple(array_shape))
+        grids=getattr(self,"_area_grid_cache",{})
+        if grid_key in grids:return copy.deepcopy(grids[grid_key])
+        cache=getattr(self,"_area_source_tables",{})
+        entry=cache.get(path)
+        if entry is None or entry[:2]!=(stat.st_mtime_ns,stat.st_size):
+            cells=self.read_csv_cells(path)
+            entry=(stat.st_mtime_ns,stat.st_size,cells)
+            cache[path]=entry
+            self._area_source_tables=cache
+        info=area_spatial_grid(path,settings,array_shape,csv_cells=entry[2])
+        grids[grid_key]=info
+        self._area_grid_cache=grids
+        return copy.deepcopy(info)
+
+
+    def area_map_snapshot(self, output_arrays, raw_arrays):
+        aa=self.state.area_analysis_settings
+        signature,px=self.area_grid_info(output_arrays,raw_arrays)
+        shape=output_arrays[aa.base_output_name].shape
+        records=[]
+        for i,r in enumerate(aa.regions):
+            pts=area_points_array(r.points)
+            if not area_region_is_complete(r):raise ValueError(f"Region '{r.name}' has no enclosed area.")
+            if np.any(pts<0) or np.any(pts[:,0]>shape[1]-1) or np.any(pts[:,1]>shape[0]-1):raise ValueError(f"Region '{r.name}' is outside the map.")
+            count=int(area_region_mask(r,shape).sum())
+            records.append(dict(region_id=r.region_id,name=r.name,shape=r.shape,color=r.color,points=copy.deepcopy(r.points),pixels=count,
+                area_um2=count*px**2 if px is not None else None,x_min=float(pts[:,0].min()),x_max=float(pts[:,0].max()),
+                y_min=float(pts[:,1].min()),y_max=float(pts[:,1].max())))
+        return dict(regions=records,pixel_size_um_per_pixel=px,base_output_name=aa.base_output_name,grid_signature=signature)
+
+
+    def save_area_map_figure(self, output_arrays, raw_arrays, path, view=None, dpi=300):
+        fig,ax=plt.subplots(figsize=(7,5.5))
+        try:
+            bounds=None if view is None else [*sorted(view[0]),*sorted(view[1])]
+            self.plot_area_analysis_map_axis(ax,None,output_arrays,raw_arrays,view_bounds=bounds)
+            if view is not None:ax.set_xlim(view[0]);ax.set_ylim(view[1])
+            fig.tight_layout();fig.savefig(path,bbox_inches="tight",dpi=dpi)
+        finally:plt.close(fig)
+
+
+    def save_display_csv(self, array, name, path, mask_layers=None, pixel_size=None):
+        values=np.array(array,copy=True,dtype=float)
+        for mask,_ in mask_layers or []:values[mask]=np.nan
+        unit=self.area_output_units(name)["unit"]
+        data_type={"at.%":"AT%","wt.%":"WT%","greyscale":"Video"}.get(unit,unit)
+        with open(path,"w",newline="",encoding="utf-8-sig") as f:
+            writer=csv.writer(f)
+            writer.writerows([["Image Name",name],["Number X Pixels",values.shape[1]],["Number Y Pixels",values.shape[0]],
+                ["Pixel Size","" if pixel_size is None else f"{pixel_size:.12g} um"],["Data Type",data_type],
+                ["Data basis","Modified values; display-masked pixels are NaN"]])
+            np.savetxt(f,values,delimiter=",",fmt="%.12g")
+
+    @staticmethod
+    def bounded_map_view(bounds, shape, minimum_span=2.0):
+        """Keep a viewport inside the image; return increasing x/y limits."""
+        rows,cols=shape
+        values=np.asarray(bounds,dtype=float)
+        if values.shape!=(4,) or not np.isfinite(values).all():
+            raise ValueError("A detail view needs four finite bounds.")
+        x0,x1=sorted(values[:2]);y0,y1=sorted(values[2:])
+        width=min(float(cols),max(minimum_span,x1-x0))
+        height=min(float(rows),max(minimum_span,y1-y0))
+        left=float(np.clip((x0+x1-width)/2,-.5,cols-.5-width))
+        top=float(np.clip((y0+y1-height)/2,-.5,rows-.5-height))
+        return [left,left+width,top,top+height]
+
+
+    @staticmethod
+    def region_intersects_detail(region, bounds, shape):
+        x0,x1,y0,y1=bounds
+        rows,cols=shape
+        a,b=max(0,int(np.ceil(x0))),min(cols-1,int(np.floor(x1)))
+        c,d=max(0,int(np.ceil(y0))),min(rows-1,int(np.floor(y1)))
+        if a>b or c>d:return False
+        mask=area_region_mask(AreaRegion(name=region["name"],shape=region["shape"],points=region["points"]),shape)
+        return bool(mask[c:d+1,a:b+1].any())
+
+
+    def detail_area_result(self, result, settings=None):
+        """Filter whole-region records; never recalculate or clip composition."""
+        aa=settings if settings is not None else self.state.area_analysis_settings
+        bounds=self.bounded_map_view(aa.detail_bounds,result["array_shape"])
+        selected=set(aa.detail_region_ids)
+        regions=[r for r in result["regions"] if
+                 (r["region_id"] in selected if aa.detail_region_mode=="Checked regions" else
+                  self.region_intersects_detail(r,bounds,result["array_shape"]))]
+        detail=copy.deepcopy(result)
+        detail["regions"]=copy.deepcopy(regions)
+        detail["view_scope"]="Detail view; whole-region statistics"
+        detail["viewport_bounds"]=bounds
+        detail["region_selection"]=aa.detail_region_mode
+        return detail
+
+
+    def detail_map_snapshot(self, output_arrays, raw_arrays):
+        result=self.area_map_snapshot(output_arrays,raw_arrays)
+        shape=output_arrays[result["base_output_name"]].shape
+        bounds=self.bounded_map_view(self.state.area_analysis_settings.detail_bounds,shape)
+        result["regions"]=[r for r in result["regions"] if self.region_intersects_detail(r,bounds,shape)]
+        result["viewport_bounds"]=bounds
+        result["view_scope"]="Detail map; complete region coordinates"
+        return result
+
+
+    def save_detail_map_figure(self, output_arrays, raw_arrays, path, dpi=300):
+        bounds=self.bounded_map_view(self.state.area_analysis_settings.detail_bounds,
+                                     output_arrays[self.state.area_analysis_settings.base_output_name].shape)
+        self.save_area_map_figure(output_arrays,raw_arrays,path,
+            view=((bounds[0],bounds[1]),(bounds[3],bounds[2])),dpi=dpi)
+
+    def area_input_names(self, output_name):
+        if output_name in self.state.get_named_files():
+            return [output_name]
+        for num, den in self.state.selected_ratios:
+            if output_name == f"{num} / {den}":
+                return list(dict.fromkeys([num, den]))
+        for formula in self.state.selected_formulas:
+            if formula.name == output_name:
+                return self.get_formula_referenced_names(formula.expression)
+        raise ValueError(f"Unknown area-analysis output '{output_name}'.")
+
+
+    def prepare_area_arrays(self, raw_arrays):
+        values = (self.apply_processing_rules(raw_arrays) if self.state.area_analysis_settings.use_processed_values
+                  else {n: np.array(a, copy=True) for n, a in raw_arrays.items()})
+        result = dict(values)
+        result.update(self.build_output_arrays(raw_arrays, values))
+        return result
+
+
+    def area_output_units(self, name):
+        named = self.state.get_named_files()
+        if name in named:
+            path = named[name]
+            loaded = self.state.loaded_source_fingerprints.get(source_key(path), {})
+            if "data_type" not in loaded:
+                self.read_csv_cells(path)
+                loaded = self.state.loaded_source_fingerprints[source_key(path)]
+            return area_unit_info(loaded["data_type"], self.state.file_processing_settings[path].scale_factor)
+        for num, den in self.state.selected_ratios:
+            if name == f"{num} / {den}":
+                nu, de = self.area_output_units(num)["unit"], self.area_output_units(den)["unit"]
+                unit = "ratio" if nu == de else f"{nu} / {de}"
+                return dict(unit=unit, data_type="Calculated ratio", scale_factor="", expected_scale_factor=None, warning="")
+        return dict(unit="derived values", data_type="Calculated formula", scale_factor="", expected_scale_factor=None, warning="")
+
+
+    def area_grid_info(self, output_arrays, raw_arrays, settings=None, check_saved=True):
+        aa=settings if settings is not None else self.state.area_analysis_settings
+        names=list(dict.fromkeys([aa.base_output_name]+aa.selected_output_names))
+        if aa.base_output_name not in output_arrays:raise ValueError("Choose an available background for area analysis.")
+        shape=output_arrays[aa.base_output_name].shape
+        if len(shape)!=2:raise ValueError("Area analysis needs two-dimensional maps.")
+        inputs={}
+        for name in names:
+            if name not in output_arrays or output_arrays[name].shape!=shape:
+                raise ValueError(f"'{name}' and the background have different pixel dimensions.")
+            for source in self.area_input_names(name):
+                if source not in raw_arrays or raw_arrays[source].shape!=shape:
+                    raise ValueError(f"Input '{source}' has a different grid from the background.")
+                info=self.area_source_grid(source,raw_arrays[source].shape)
+                if info["pixel_size_um"] is not None and info["pixel_size_um"]<=0:
+                    raise ValueError(f"Pixel size for '{source}' must be positive.")
+                inputs[source]=info
+        base_sources=self.area_input_names(aa.base_output_name)
+        if not base_sources:raise ValueError("The background has no input image grid.")
+        reference=inputs[base_sources[0]]
+        spatial_keys=("shape","spatial_rows","spatial_columns")
+        for name,info in inputs.items():
+            if any(info[k]!=reference[k] for k in spatial_keys):
+                raise ValueError(f"Input '{name}' has different image cropping or pixel dimensions. CSV header lengths may differ; image coordinates must match.")
+        known=[v["pixel_size_um"] for v in inputs.values() if v["pixel_size_um"] is not None]
+        if known and any(not np.isclose(v,known[0],rtol=1e-6,atol=0) for v in known):
+            raise ValueError("Area-analysis maps have different pixel sizes. Correct preprocessing calibration.")
+        masks={}
+        ms=self.state.masking_and_noise_settings
+        if aa.exclude_masked and ms.enabled and ms.grayscale_enabled:
+            targets=set(aa.selected_output_names)
+            for name in aa.selected_output_names:targets.update(self.area_input_names(name))
+            for rule in ms.grayscale_rules:
+                if not rule.enabled or not any(self.grayscale_rule_applies_to_output(rule,n) for n in targets):continue
+                source=rule.source_name
+                if source not in raw_arrays:raise ValueError(f"Mask source '{source}' is unavailable.")
+                info=self.area_source_grid(source,raw_arrays[source].shape)
+                if any(info[k]!=reference[k] for k in spatial_keys):
+                    raise ValueError(f"Mask source '{source}' uses a different image grid or cropping.")
+                if known and info["pixel_size_um"] is not None and not np.isclose(info["pixel_size_um"],known[0],rtol=1e-6,atol=0):
+                    raise ValueError(f"Mask source '{source}' has a different pixel size.")
+                masks[source]=info
+        signature=dict(background=dict(reference),background_input=base_sources[0],input_grids=inputs,mask_grids=masks,
+                       grid_format=2)
+        if check_saved and aa.regions:
+            saved=aa.grid_signature
+            if not saved:raise ValueError("These outlines have no recorded grid. Review them and use 'Use current grid', or clear and redraw them.")
+            def migrate(info,name):
+                if "spatial_rows" in info:return info
+                old=copy.deepcopy(self.state.file_processing_settings[self.state.get_named_files()[name]])
+                old.manual_rows=",".join(str(i+1) for i in info.get("removed_rows",[]))
+                old.manual_columns=",".join(str(i+1) for i in info.get("removed_columns",[]))
+                if "pixel_size_um" in info:old.pixel_size_um="" if info["pixel_size_um"] is None else str(info["pixel_size_um"])
+                return self.area_source_grid(name,info.get("shape",list(shape)),old)
+            def compare(previous,current,name):
+                try:previous=migrate(previous,name)
+                except (ValueError,KeyError,OSError) as exc:
+                    raise ValueError("The saved grid could not be verified after preprocessing changed. Restore preprocessing, or review the outlines and use 'Use current grid'.") from exc
+                for key in spatial_keys+("pixel_size_um",):
+                    if previous.get(key)!=current.get(key):
+                        raise ValueError("The image grid, cropping or calibration changed since these regions were drawn. Restore preprocessing, or review the outlines and use 'Use current grid'.")
+            compare(saved.get("background",{}),reference,saved.get("background_input",base_sources[0]))
+            for group,current in (("input_grids",inputs),("mask_grids",masks)):
+                for name,info in current.items():
+                    if name in saved.get(group,{}):compare(saved[group][name],info,name)
+        px=known[0] if known and all(v["pixel_size_um"] is not None for v in inputs.values()) else None
+        return signature,px
+
+
+    def area_analysis_description(self, result=None):
+        aa=self.state.area_analysis_settings
+        basis="modified values after low-value protection and conditional replacements" if aa.use_processed_values else "scaled input values before low-value protection and conditional replacements"
+        common=aa.common_pixels or aa.normalize_to_100
+        return (f"Area analysis uses {basis}. "
+                + ("All selected outputs use the same finite pixels and the union of their applicable masks. " if common
+                   else "Each output uses its own finite pixels and applicable masks. ")
+                + ("Masked pixels are excluded. " if aa.exclude_masked else "Greyscale masks are not excluded. ")
+                + "Real zeros are included. Pixel centres inside or on boundaries are selected; polygon and freehand paths use non-zero winding. "
+                "Sample SD describes spatial variation, not measurement uncertainty; SD is unavailable for fewer than two pixels. "
+                "Ratio-of-means counts and valid pixel-ratio counts are recorded separately. "
+                + ("Relative composition refers only to the selected quantified elements, rescaled to 100%; scaled SD uses the region total as a fixed scaling factor. " if aa.normalize_to_100 else "No normalization to 100% is applied. ")
+                + "An optional linked detail view filters complete regions; viewport changes never clip their statistics. "
+                "Analyse this zoom area explicitly creates a new region for the viewport. "
+                "Physical areas require matching calibration for all map dependencies. These results are map averages; they do not quantify a summed EDS spectrum.")
+
+    def get_base_display_settings(self, base_output_name: str) -> OutputDisplaySettings:
+        return self.state.display_settings.get(
+            base_output_name,
+            OutputDisplaySettings(
+                mode="Continuous",
+                colormap="gray" if is_grayscale_name(base_output_name) else "viridis",
+                colorbar_label=default_colorbar_label(base_output_name),
+            ),
+        )
+
+    @staticmethod
+    def resolve_area_region_color(region: AreaRegion, index: int) -> str:
+        color = str(region.color or "").strip()
+        if color and is_color_like(color):
+            return color
+        return DEFAULT_AREA_REGION_COLORS[index % len(DEFAULT_AREA_REGION_COLORS)]
+
+    def get_area_normalization_names(self, selected_output_names: List[str]) -> List[str]:
+        """The selected element maps whose means are rescaled to add up to 100 (greyscale images are left out)."""
+        return [
+            name for name in selected_output_names
+            if name in self.state.get_named_files() and not is_grayscale_name(name)
+        ]
+
+    def compute_area_analysis(self, output_arrays, raw_arrays, settings=None):
+        aa = settings if settings is not None else self.state.area_analysis_settings
+        ensure_unique_region_colors(aa.regions)
+        names = list(dict.fromkeys(aa.selected_output_names))
+        if not names:
+            raise ValueError("Select at least one output for area analysis.")
+        signature, px = self.area_grid_info(output_arrays, raw_arrays, aa)
+        shape = output_arrays[aa.base_output_name].shape
+        if not aa.regions:
+            raise ValueError("Draw at least one region for area analysis.")
+        units = {n:self.area_output_units(n) for n in names}
+        ratios = {f"{n} / {d}":(n,d) for n,d in self.state.selected_ratios}
+        normalization_names = self.get_area_normalization_names(names) if aa.normalize_to_100 else []
+        if aa.normalize_to_100:
+            if len(normalization_names) < 2:
+                raise ValueError("Relative composition needs at least two selected elemental maps.")
+            base_units = {units[n]["unit"] for n in normalization_names}
+            if len(base_units) != 1 or not base_units.issubset({"at.%", "wt.%"}):
+                raise ValueError("Relative composition requires quantified element maps with matching at.% or wt.% units and correct scale factors.")
+        common_mode = aa.common_pixels or aa.normalize_to_100
+        hidden, finite = {}, {}
+        for name in names:
+            sources = list(ratios[name]) if name in ratios else [name]
+            mask = np.zeros(shape, dtype=bool)
+            # A ratio uses the masks of both its inputs as well as its own mask.
+            if aa.exclude_masked:
+                for target in set([name] + self.area_input_names(name)):
+                    part = self.build_combined_grayscale_mask(raw_arrays,output_name=target)
+                    if part is not None:
+                        if part.shape != shape:
+                            raise ValueError(f"Mask for '{target}' has a different shape.")
+                        mask |= part
+            hidden[name] = mask
+            good = np.ones(shape,dtype=bool)
+            for source in sources:
+                good &= np.isfinite(output_arrays[source])
+            finite[name] = good
+        union_hidden = np.logical_or.reduce(list(hidden.values()))
+        common_finite = np.logical_and.reduce(list(finite.values()))
+        results, seen = [], set()
+        for index, region in enumerate(aa.regions):
+            if not region.name.strip() or region.name.strip().casefold() in seen:
+                raise ValueError("Each region needs its own non-empty name.")
+            seen.add(region.name.strip().casefold())
+            if not area_region_is_complete(region):
+                raise ValueError(f"Region '{region.name}' has an invalid or zero-area outline.")
+            pts = area_points_array(region.points)
+            if np.any(pts < -1e-8) or np.any(pts[:,0] > shape[1]-1+1e-8) or np.any(pts[:,1] > shape[0]-1+1e-8):
+                raise ValueError(f"Region '{region.name}' lies outside the current map. Edit it or restore the original grid.")
+            selected = area_region_mask(region,shape)
+            pixels = int(selected.sum())
+            if pixels == 0:
+                raise ValueError(f"Region '{region.name}' contains no pixel centres.")
+            stats = {}
+            common = selected & ~union_hidden & common_finite
+            for name in names:
+                excluded = union_hidden if common_mode else hidden[name]
+                valid = common_finite if common_mode else finite[name]
+                basis = selected & ~excluded & valid
+                values = output_arrays[name]
+                keep = basis & np.isfinite(values)
+                a = values[keep]
+                count = int(a.size)
+                entry = dict(pixels_used=count, pixels_masked=int((selected & excluded).sum()),
+                    pixels_empty=int((selected & ~excluded & ~valid).sum()),
+                    pixels_undefined=int((basis & ~np.isfinite(values)).sum()),
+                    mean=float(np.mean(a)) if count else None,
+                    sd=float(np.std(a,ddof=1)) if count > 1 else None,
+                    median=float(np.median(a)) if count else None,
+                    min=float(a.min()) if count else None,max=float(a.max()) if count else None,
+                    normalized=None, normalized_sd=None, ratio_of_means=None, ratio_pixels_used=0,
+                    unit=units[name]["unit"], used_area_um2=count*px**2 if px is not None else None)
+                if name in ratios:
+                    num,den=ratios[name]
+                    both = basis & np.isfinite(output_arrays[num]) & np.isfinite(output_arrays[den])
+                    entry["ratio_pixels_used"] = int(both.sum())
+                    if both.any():
+                        den_mean = float(output_arrays[den][both].mean())
+                        if den_mean != 0:
+                            with np.errstate(over="ignore",invalid="ignore",divide="ignore"):
+                                ratio=float(output_arrays[num][both].mean()/den_mean)
+                            if np.isfinite(ratio):
+                                entry["ratio_of_means"]=ratio
+                stats[name]=entry
+            if normalization_names:
+                means=[stats[n]["mean"] for n in normalization_names]
+                if all(v is not None for v in means):
+                    if any(v < 0 for v in means):
+                        raise ValueError("Relative composition cannot use negative elemental means.")
+                    total=float(sum(means))
+                    if total > 0:
+                        for name in normalization_names:
+                            entry=stats[name]
+                            entry["normalized"]=100*entry["mean"]/total
+                            # Scaled spatial SD, not uncertainty of a normalized composition.
+                            entry["normalized_sd"]=100*entry["sd"]/total if entry["sd"] is not None else None
+            for name,entry in stats.items():
+                if name in ratios:
+                    entry.update(value=entry["ratio_of_means"],value_kind="ratio of means",value_sd=None,
+                                 display_pixels_used=entry["ratio_pixels_used"])
+                elif name in normalization_names:
+                    entry.update(value=entry["normalized"],value_kind="normalised mean",value_sd=entry["normalized_sd"],
+                                 display_pixels_used=entry["pixels_used"])
+                else:
+                    entry.update(value=entry["mean"],value_kind="mean",value_sd=entry["sd"],display_pixels_used=entry["pixels_used"])
+                entry["display_area_um2"]=entry["display_pixels_used"]*px**2 if px is not None else None
+                entry["display_unit"]="% of selected elements" if name in normalization_names else entry["unit"]
+            results.append(dict(region_id=region.region_id,name=region.name,shape=normalize_area_shape(region.shape),color=self.resolve_area_region_color(region,index),
+                points=pts.tolist(),x_min=float(pts[:,0].min()),x_max=float(pts[:,0].max()),
+                y_min=float(pts[:,1].min()),y_max=float(pts[:,1].max()),pixels=pixels,
+                area_um2=pixels*px**2 if px is not None else None,
+                common_pixels_used=int(common.sum()) if common_mode else None,
+                common_area_um2=int(common.sum())*px**2 if common_mode and px is not None else None,stats=stats))
+        return dict(base_output_name=aa.base_output_name,selected_output_names=names,array_shape=shape,
+            source_manifest=source_manifest(self.state), source_decisions=copy.deepcopy(self.state.source_decisions),
+            source_mode=self.state.source_mode, source_dataset_id=self.state.source_dataset_id,
+            pixel_size_um_per_pixel=px,exclude_masked=aa.exclude_masked,masking_active=bool(union_hidden.any()),
+            normalize_to_100=aa.normalize_to_100,normalization_names=normalization_names,common_pixels=common_mode,
+            data_basis="Modified values" if aa.use_processed_values else "Scaled input values",units=units,
+            grid_signature=signature,regions=results,plot_settings=dict(error_bars=aa.error_bars, title=aa.title,
+                region_fill_opacity=aa.region_fill_opacity,legend_position=aa.legend_position,y_label=aa.y_label,right_y_label=aa.right_y_label))
+
+    def save_area_analysis_csv(self, result, save_path):
+        header=["region","region_color","shape","output","unit","display_unit","display_value","display_kind","display_pixels_used",
+                "pixels_in_region","pixels_used","pixels_masked_left_out","pixels_empty","pixel_ratios_undefined",
+                "area_um2","used_area_um2","display_area_um2","mean","sd","median","min","max",
+                "relative_mean_percent","scaled_spatial_sd","ratio_of_means","ratio_pixels_used",
+                "data_basis","common_pixels","exclude_masked","declared_data_type","scale_factor","pixel_size_um","chart_title","error_bars","fill_opacity_percent","view_scope","view_x_min","view_x_max","view_y_min","view_y_max"]
+        with open(save_path,"w",newline="",encoding="utf-8-sig") as f:
+            writer=csv.writer(f);writer.writerow(header)
+            for r in result["regions"]:
+                for name in result["selected_output_names"]:
+                    e=r["stats"][name];u=result["units"][name]
+                    writer.writerow([area_csv_cell(v) for v in [r["name"],r["color"],r["shape"],name,e["unit"],e["display_unit"],e["value"],e["value_kind"],e["display_pixels_used"],
+                        r["pixels"],e["pixels_used"],e["pixels_masked"],e["pixels_empty"],e["pixels_undefined"],r["area_um2"],e["used_area_um2"],e["display_area_um2"],
+                        e["mean"],e["sd"],e["median"],e["min"],e["max"],e["normalized"],e["normalized_sd"],e["ratio_of_means"],e["ratio_pixels_used"],
+                        result["data_basis"],result["common_pixels"],result["exclude_masked"],u["data_type"],u["scale_factor"],result["pixel_size_um_per_pixel"],result.get("plot_settings",{}).get("title",""),
+                        result.get("plot_settings",{}).get("error_bars","None"),result.get("plot_settings",{}).get("region_fill_opacity",0),result.get("view_scope","Overview; whole-region statistics")]+list(result.get("viewport_bounds",[None]*4))])
+
+    def save_area_analysis_excel(self, result, save_path, project_snapshot=None, output_arrays=None, raw_arrays=None):
+        snapshot = copy.deepcopy(project_dict(self.state)) if project_snapshot is None else project_snapshot
+        snapshot = copy.deepcopy(snapshot)
+        if "source_manifest" in result:
+            snapshot["source_manifest"] = copy.deepcopy(result["source_manifest"])
+            snapshot["source_provenance"] = dict(schema_version=1, mode=result.get("source_mode", self.state.source_mode),
+                dataset_id=result.get("source_dataset_id", self.state.source_dataset_id), decisions=copy.deepcopy(result.get("source_decisions", [])))
+            for record in result["source_manifest"]:
+                current = self.state.source_fingerprints.get(source_key(record["path"]))
+                if current and record.get("sha256") and current["sha256"].lower() != record["sha256"].lower():
+                    raise SourceVerificationError("These cached results use an earlier source-file snapshot. Reload and recalculate the maps before exporting.")
+        figure = area_report_image(self, result, output_arrays, raw_arrays)
+        return write_area_excel_report(result, save_path, snapshot, figures=[figure])
+
+    def save_area_regions_csv(self, result: dict, save_path: str) -> None:
+        """The outline of every region, so that the same regions can be drawn again."""
+        header = [
+            "region", "shape", "color", "pixels_in_region", "area_um2", "pixel_size_um_per_pixel",
+            "x_min", "x_max", "y_min", "y_max", "outline_points_x_y", "view_scope", "view_x_min", "view_x_max", "view_y_min", "view_y_max",
+        ]
+        pixel_size = result.get("pixel_size_um_per_pixel")
+        with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            for region in result["regions"]:
+                writer.writerow([
+                    area_csv_cell(region["name"]), region["shape"], region["color"], region["pixels"],
+                    "" if region["area_um2"] is None else region["area_um2"],
+                    "" if pixel_size is None else pixel_size,
+                    region["x_min"], region["x_max"], region["y_min"], region["y_max"],
+                    format_area_points(region["points"]),result.get("view_scope","Overview; complete region coordinates"),
+                ]+list(result.get("viewport_bounds",[None]*4)))
+
+    def draw_area_regions(
+        self,
+        ax,
+        regions: List[AreaRegion],
+        array_shape: Tuple[int, int],
+        selected_index: Optional[int] = None,
+        show_labels: bool = True,
+        label_size: Optional[float] = None,
+    ) -> None:
+        """Draw the outline (and the name) of every region on a map."""
+        rows, cols = array_shape
+        x_limits, y_limits = ax.get_xlim(), ax.get_ylim()
+        for index, region in enumerate(regions):
+            outline = area_region_outline(region)
+            if len(outline) < 2:
+                continue
+            vx0,vx1=sorted(x_limits);vy0,vy1=sorted(y_limits)
+            if outline[:,0].max()<vx0 or outline[:,0].min()>vx1 or outline[:,1].max()<vy0 or outline[:,1].min()>vy1:continue
+            color = self.resolve_area_region_color(region, index)
+            opacity=max(0,min(60,int(self.state.area_analysis_settings.region_fill_opacity)))/100
+            if opacity:
+                ax.fill(outline[:,0],outline[:,1],facecolor=color,edgecolor="none",alpha=opacity,zorder=19)
+            line_width = 2.8 if index == selected_index else 1.8
+            ax.plot(
+                outline[:, 0], outline[:, 1], color=color, linewidth=line_width, solid_joinstyle="round",
+                zorder=20, scalex=False, scaley=False,
+                path_effects=[patheffects.withStroke(linewidth=line_width + 1.6, foreground="black")],
+            )
+            name = region.name.strip()
+            if not show_labels or not name:
+                continue
+            x_low, x_high = float(np.min(outline[:, 0])), float(np.max(outline[:, 0]))
+            y_top = float(np.min(outline[:, 1]))
+            gap = max(rows * 0.012, 1.5)
+            if y_top - gap > rows * 0.07:
+                text_y, vertical = y_top - gap, "bottom"
+            else:
+                text_y, vertical = y_top + gap, "top"
+            centre = (x_low + x_high) / 2.0
+            if centre < cols * 0.15:
+                text_x, horizontal = max(x_low, 0.0), "left"
+            elif centre > cols * 0.85:
+                text_x, horizontal = min(x_high, cols - 1.0), "right"
+            else:
+                text_x, horizontal = centre, "center"
+            text_x=float(np.clip(text_x,vx0+.03*(vx1-vx0),vx1-.03*(vx1-vx0)))
+            text_y=float(np.clip(text_y,vy0+.03*(vy1-vy0),vy1-.03*(vy1-vy0)))
+            if text_y<=vy0+.04*(vy1-vy0):vertical="top"
+            ax.text(
+                text_x, text_y, name, color="white", ha=horizontal, va=vertical,
+                fontsize=label_size if label_size is not None else 9, fontname=DEFAULT_FONT_NAME,
+                bbox=dict(facecolor="black", alpha=0.62, edgecolor=color, linewidth=1.0, pad=1.5),
+                zorder=30, clip_on=True,
+            )
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
+
+    def plot_area_analysis_map_axis(
+        self,
+        ax,
+        colorbar_axis,
+        output_arrays: Dict[str, np.ndarray],
+        raw_arrays: Dict[str, np.ndarray],
+        selected_index: Optional[int] = None,
+        add_scale_bar: bool = False,
+        pixel_size_um: Optional[float] = None,
+        view_bounds=None,
+    ) -> None:
+        """The background map with the outlines of the regions (left panel of the area-analysis figure)."""
+        aa = self.state.area_analysis_settings
+        base_name = aa.base_output_name
+        if base_name not in output_arrays:
+            raise ValueError(f"Area-analysis background '{base_name}' is not available.")
+        array = output_arrays[base_name]
+        self.plot_output_map_axis(
+            ax,
+            array,
+            base_name,
+            self.get_base_display_settings(base_name),
+            mask_layers=self.build_grayscale_mask_layers(raw_arrays, output_name=base_name),
+            line_coords=None,
+            show_colorbar=True,
+            add_scale_bar=add_scale_bar,
+            pixel_size_um=pixel_size_um,
+            colorbar_axis=colorbar_axis,
+            colorbar_side_override="left",
+        )
+        if view_bounds is not None:
+            ax.set_xlim(view_bounds[:2]);ax.set_ylim(view_bounds[3],view_bounds[2])
+        text_size = parse_tick_label_size(aa.text_label_size)
+        self.draw_area_regions(
+            ax,
+            [region for region in aa.regions if area_region_is_complete(region)],
+            array.shape,
+            selected_index=selected_index,
+            show_labels=aa.show_region_labels,
+            label_size=text_size,
+        )
+        if aa.image_title.strip():
+            ax.set_title(aa.image_title.strip(), fontname=DEFAULT_FONT_NAME)
+        if text_size is not None:
+            ax.title.set_fontsize(text_size)
+            if colorbar_axis is not None:
+                colorbar_axis.yaxis.label.set_fontsize(text_size)
+
+    def plot_area_analysis_axis(self, ax, result: dict, title_override: Optional[str] = None) -> None:
+        """Grouped bars: one group for every output, one bar for every region."""
+        aa = self.state.area_analysis_settings
+        names = list(result["selected_output_names"])
+        regions = result["regions"]
+
+        value_names, ratio_names = self.classify_line_profile_outputs(names)
+        use_right_axis = bool(value_names) and bool(ratio_names)
+        if use_right_axis:
+            left_names, right_names = value_names, ratio_names
+            right_ax = ax.twinx()
+            try:
+                right_ax.patch.set_visible(False)
+            except Exception:
+                pass
+        else:
+            left_names, right_names = list(names), []
+            right_ax = None
+        try:
+            ax._elementti_right_axis = right_ax
+        except Exception:
+            pass
+
+        ordered_names = left_names + right_names
+        position = {name: float(index) for index, name in enumerate(ordered_names)}
+        region_count = max(len(regions), 1)
+        bar_step = 0.8 / region_count
+        show_error_bars = aa.error_bars.strip().lower() == "standard deviation"
+
+        handles, labels = [], []
+        top_by_axis = {id(ax): 0.0}
+        bottom_by_axis = {id(ax): 0.0}
+        if right_ax is not None:
+            top_by_axis[id(right_ax)] = 0.0
+            bottom_by_axis[id(right_ax)] = 0.0
+
+        for region_index, region in enumerate(regions):
+            offset = (region_index - (region_count - 1) / 2.0) * bar_step
+            handle = None
+            for target_ax, group in ((ax, left_names), (right_ax, right_names)):
+                if target_ax is None or not group:
+                    continue
+                heights, errors = [], []
+                for name in group:
+                    entry = region["stats"][name]
+                    value = entry.get("value")
+                    spread = entry.get("value_sd")
+                    heights.append(np.nan if value is None else float(value))
+                    errors.append(0.0 if (value is None or spread is None) else float(spread))
+                bars = target_ax.bar(
+                    [position[name] + offset for name in group],
+                    heights,
+                    width=bar_step * 0.92,
+                    color=region["color"],
+                    edgecolor="black",
+                    linewidth=0.6,
+                    yerr=errors if show_error_bars else None,
+                    capsize=2 if show_error_bars else 0,
+                    error_kw=dict(elinewidth=0.8, ecolor="black"),
+                    zorder=3,
+                )
+                if handle is None:
+                    handle = bars
+                for height, error in zip(heights, errors):
+                    if not np.isfinite(height):
+                        continue
+                    reach = error if show_error_bars else 0.0
+                    top_by_axis[id(target_ax)] = max(top_by_axis[id(target_ax)], height + reach)
+                    bottom_by_axis[id(target_ax)] = min(bottom_by_axis[id(target_ax)], height - reach)
+            if handle is not None:
+                handles.append(handle)
+                labels.append(region["name"])
+
+        ax.set_xticks([position[name] for name in ordered_names])
+        crowded = len(ordered_names) > 6 or sum(len(name) for name in ordered_names) > 36
+        ax.set_xlim(-0.6, max(len(ordered_names), 1) - 0.4)
+        if use_right_axis:
+            ax.axvline(len(left_names) - 0.5, color="0.5", linestyle="--", linewidth=0.8, zorder=1)
+
+        normalized_names=set(result.get("normalization_names") or [])
+        def display_unit(name):
+            return "%" if name in normalized_names else result["units"][name]["unit"]
+        def automatic_label(group):
+            units={display_unit(n) for n in group}
+            if len(units)>1:return "Mean (units below)"
+            unit=next(iter(units),"value")
+            if unit=="%":return "Relative composition of selected elements (%)"
+            if unit=="ratio":return "Ratio"
+            return "Mean ("+unit+")"
+        ax.set_ylabel(aa.y_label.strip() or automatic_label(left_names),fontname=DEFAULT_FONT_NAME)
+        if right_ax is not None:
+            right_ax.set_ylabel(aa.right_y_label.strip() or automatic_label(right_names),fontname=DEFAULT_FONT_NAME)
+        mixed_left=len({display_unit(n) for n in left_names})>1
+        mixed_right=len({display_unit(n) for n in right_names})>1
+        labels_for_ticks=[f"{n}\n({display_unit(n)})" if (mixed_left if n in left_names else mixed_right) else n for n in ordered_names]
+        ax.set_xticklabels(labels_for_ticks,rotation=30 if crowded else 0,ha="right" if crowded else "center",fontname=DEFAULT_FONT_NAME)
+
+        plot_title = title_override if title_override is not None else aa.title.strip()
+        if plot_title:
+            ax.set_title(plot_title, fontname=DEFAULT_FONT_NAME)
+
+        legend_outside = normalize_line_profile_legend_position(aa.legend_position) == "Outside right"
+        value_ranges = []
+        for axis_obj in (ax, right_ax):
+            if axis_obj is None:
+                continue
+            top = top_by_axis[id(axis_obj)]
+            bottom = bottom_by_axis[id(axis_obj)]
+            if top <= 0 and bottom >= 0:
+                top = 1.0
+            value_ranges.append((axis_obj, bottom, top))
+            span = top - bottom
+            axis_obj.set_ylim(bottom - (0.06 * span if bottom < 0 else 0.0), bottom + span * 1.06)
+
+        if not handles:
+            ax.text(0.5, 0.5, "No values in the regions", ha="center", va="center", transform=ax.transAxes)
+
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=2)
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.set_axisbelow(True)
+        if right_ax is not None:
+            right_ax.grid(False)
+
+        tick_size = parse_tick_label_size(aa.tick_label_size)
+        if tick_size is not None:
+            for axis_obj in (ax, right_ax):
+                if axis_obj is None:
+                    continue
+                axis_obj.tick_params(axis="both", labelsize=tick_size)
+                for tick_label in list(axis_obj.get_xticklabels()) + list(axis_obj.get_yticklabels()):
+                    tick_label.set_fontsize(tick_size)
+
+        text_size = parse_tick_label_size(aa.text_label_size)
+        if text_size is not None:
+            for axis_obj in (ax, right_ax):
+                if axis_obj is None:
+                    continue
+                axis_obj.xaxis.label.set_fontsize(text_size)
+                axis_obj.yaxis.label.set_fontsize(text_size)
+                axis_obj.title.set_fontsize(text_size)
+
+        if handles:
+            # Inside: above the bars, with just enough headroom. Outside: to the right of the plot,
+            # clear of the right y-axis. fit_area_chart_legend measures the chart as it is drawn.
+            ax._elementti_area_legend = {
+                "legend_axis": right_ax if right_ax is not None else ax,
+                "right_axis": right_ax,
+                "outside": legend_outside,
+                "handles": handles,
+                "labels": labels,
+                "value_ranges": value_ranges,
+                "fontsize": text_size if text_size is not None else "small",
+            }
+            fit_area_chart_legend(ax)
+
+    def save_area_analysis_figure(self, result: dict, save_path: str, dpi: int = 300) -> None:
+        fig, ax = plt.subplots(figsize=(7, 4.5), dpi=dpi)
+        self.plot_area_analysis_axis(ax, result)
+        if normalize_line_profile_legend_position(self.state.area_analysis_settings.legend_position) == "Outside right":
+            fig.subplots_adjust(right=0.72)
+        else:
+            fig.tight_layout()
+        fit_area_chart_legend(ax)
+        fig.savefig(save_path, bbox_inches="tight", dpi=dpi)
+        plt.close(fig)
+
+    def save_area_analysis_combined_figure(
+        self,
+        result: dict,
+        output_arrays: Dict[str, np.ndarray],
+        raw_arrays: Dict[str, np.ndarray],
+        save_path: str,
+        dpi: int = 300,
+        add_scale_bar: bool = False,
+        pixel_size_um: Optional[float] = None,
+        view_bounds=None,
+    ) -> None:
+        """Two panels of the same size: the map with the regions, and the chart of the region values."""
+        fig = plt.figure(figsize=(11, 4.8), dpi=dpi)
+        panel_y = 0.16
+        panel_h = 0.68
+        panel_w = 0.32
+        map_x = 0.12
+        chart_x = 0.53
+        ax_map = fig.add_axes([map_x, panel_y, panel_w, panel_h])
+        ax_chart = fig.add_axes([chart_x, panel_y, panel_w, panel_h])
+        cax = fig.add_axes([map_x - 0.026, panel_y, 0.014, panel_h])
+
+        self.plot_area_analysis_map_axis(
+            ax_map,
+            cax,
+            output_arrays,
+            raw_arrays,
+            add_scale_bar=add_scale_bar,
+            pixel_size_um=pixel_size_um,
+            view_bounds=view_bounds,
+        )
+        self.plot_area_analysis_axis(ax_chart, result)
+
+        # Match the chart to the final size of the map panel (the map keeps its aspect ratio).
+        try:
+            fig.canvas.draw()
+            map_pos = ax_map.get_position()
+            chart_pos = ax_chart.get_position()
+            cax.set_position([map_pos.x0 - 0.022, map_pos.y0, 0.012, map_pos.height])
+            new_chart_position = [chart_pos.x0, map_pos.y0, map_pos.width, map_pos.height]
+            ax_chart.set_position(new_chart_position)
+            right_chart_ax = getattr(ax_chart, "_elementti_right_axis", None)
+            if right_chart_ax is not None:
+                right_chart_ax.set_position(new_chart_position)
+            fit_area_chart_legend(ax_chart)
         except Exception:
             pass
 
@@ -3336,6 +5456,37 @@ class ProcessingEngine:
             },
         }
 
+        aa = self.state.area_analysis_settings
+        area_analysis_settings = {
+            "enabled": aa.enabled,
+            "base_output_name": aa.base_output_name,
+            "selected_output_names": aa.selected_output_names,
+            "regions": [
+                {
+                    "name": region.name,
+                    "shape": normalize_area_shape(region.shape),
+                    "color": region.color,
+                    "points": [list(point) for point in region.points],
+                }
+                for region in aa.regions
+            ],
+            "exclude_masked_pixels": aa.exclude_masked,
+            "use_processed_values": aa.use_processed_values,
+            "common_pixels": aa.common_pixels or aa.normalize_to_100,
+            "grid_signature": aa.grid_signature,
+            "normalize_means_to_100": aa.normalize_to_100,
+            "error_bars": aa.error_bars,
+            "show_region_labels": aa.show_region_labels,
+            "detail_view": {"enabled":aa.detail_enabled,"bounds":aa.detail_bounds,"region_mode":aa.detail_region_mode,"region_ids":aa.detail_region_ids},
+            "image_title": aa.image_title,
+            "title": aa.title,
+            "y_label": aa.y_label,
+            "right_y_label": aa.right_y_label,
+            "legend_position": normalize_line_profile_legend_position(aa.legend_position),
+            "axis_number_size": aa.tick_label_size,
+            "text_label_size": aa.text_label_size,
+        }
+
         return {
             "app_name": APP_NAME,
             "app_version": APP_VERSION,
@@ -3371,6 +5522,7 @@ class ProcessingEngine:
             },
             "display_settings": display_settings,
             "line_profile_settings": line_profile_settings,
+            "area_analysis_settings": area_analysis_settings,
             "scale_bar_settings": {
                 "enabled": self.state.scale_bar_settings.enabled,
                 "length_um": self.state.scale_bar_settings.length_um,
@@ -3383,6 +5535,7 @@ class ProcessingEngine:
                 "project_name": self.state.project_name,
                 "save_figures": self.state.save_png,
                 "save_csv": self.state.save_csv,
+                "save_word": self.state.save_word,
                 "figure_format": self.state.figure_format,
                 "figure_dpi": self.state.figure_dpi,
             },
@@ -3566,18 +5719,38 @@ class ProcessingEngine:
                     )
         lines.append("")
 
+        aa = self.state.area_analysis_settings
+        lines.append("Area analysis settings:")
+        if aa.enabled:
+            lines.append(self.area_analysis_description())
+        lines.append(f"- Enabled: {'Yes' if aa.enabled else 'No'}")
+        if aa.enabled:
+            lines.append(f"- Background output: {aa.base_output_name}")
+            lines.append(f"- Analysed outputs: {', '.join(aa.selected_output_names) if aa.selected_output_names else 'None'}")
+            lines.append(f"- Masked pixels left out: {'Yes' if aa.exclude_masked else 'No'}")
+            lines.append(f"- Means of the element maps normalised to 100: {'Yes' if aa.normalize_to_100 else 'No'}")
+            lines.append(f"- Error bars: {aa.error_bars if aa.error_bars else 'None'}")
+            lines.append("- Regions:")
+            for region in aa.regions:
+                lines.append(
+                    f"  - {region.name}: {normalize_area_shape(region.shape).lower()}, "
+                    f"{describe_area_region_outline(region)} (pixels)"
+                )
+        lines.append("")
+
         lines.append("Output options:")
         lines.append(f"- Output folder: {self.state.output_folder}")
         lines.append(f"- Project name: {self.state.project_name if self.state.project_name else 'None'}")
         lines.append(f"- Save figure files: {'Yes' if self.state.save_png else 'No'}")
         lines.append(f"- Save processed CSV files: {'Yes' if self.state.save_csv else 'No'}")
+        lines.append(f"- Save Word report: {'Yes' if self.state.save_word else 'No'}")
         lines.append(f"- Figure format: {self.state.figure_format}")
         lines.append(f"- Figure DPI: {self.state.figure_dpi}")
         lines.append(f"- Additional figures with scale bar: {'Yes' if self.state.scale_bar_settings.enabled else 'No'}")
 
         return "\n".join(lines)
 
-    def generate_outputs(self, progress=None) -> Tuple[str, str]:
+    def generate_outputs(self, progress=None) -> Tuple[str, Optional[str]]:
         """Save every output. Returns (project file, Detailed explanations.docx). `progress(done, total, text)`
         is called before each output, so a window can show how far it is."""
         output_folder = self.state.output_folder.strip()
@@ -3594,7 +5767,8 @@ class ProcessingEngine:
         lp_settings = self.state.line_profile_settings
         total_steps = (len(self.state.selected_maps) + len(self.state.selected_ratios)
                        + len([f for f in self.state.selected_formulas if f.name.strip()])
-                       + (1 if lp_settings.enabled else 0) + 1)
+                       + (1 if lp_settings.enabled else 0)
+                       + (1 if self.state.area_analysis_settings.enabled else 0) + 1)
         done_steps = [0]
 
         def tick(text: str) -> None:
@@ -3613,6 +5787,9 @@ class ProcessingEngine:
 
         raw_arrays = self.load_raw_arrays()
         working_arrays = self.apply_processing_rules(raw_arrays)
+        if self.state.area_analysis_settings.enabled:
+            preflight=self.compute_area_analysis(self.prepare_area_arrays(raw_arrays), raw_arrays)
+            if self.state.area_analysis_settings.detail_enabled:self.detail_area_result(preflight)
 
         for map_name in self.state.selected_maps:
             tick(f"Map {map_name}")
@@ -3818,12 +5995,69 @@ class ProcessingEngine:
                         pixel_size_um=pixel_size_um,
                     )
 
-        tick("Detailed explanations and project file")
+        aa = self.state.area_analysis_settings
+        if aa.enabled:
+            tick("Area analysis")
+            if not aa.base_output_name:
+                raise ValueError("Area analysis is enabled, but no background output is selected.")
+            if not aa.selected_output_names:
+                raise ValueError("Area analysis is enabled, but no outputs are selected.")
+            if not any(area_region_is_complete(region) for region in aa.regions):
+                raise ValueError("Area analysis is enabled, but no region has been drawn.")
+
+            area_arrays = self.prepare_area_arrays(raw_arrays)
+            area_result = self.compute_area_analysis(area_arrays, raw_arrays)
+
+            if self.state.save_csv:
+                self.save_area_analysis_csv(area_result, output_path(add_prefix("area_analysis"), "csv"))
+                self.save_area_regions_csv(area_result, output_path(add_prefix("area_analysis_regions"), "csv"))
+
+            if self.state.save_png:
+                self.save_area_analysis_figure(area_result, output_path(add_prefix("area_analysis"), ext), dpi=dpi)
+
+                area_pixel_size_um = None
+                try:
+                    area_pixel_size_um = self.get_pixel_size_um_for_output(aa.base_output_name)
+                except Exception:
+                    area_pixel_size_um = None
+                self.save_area_analysis_combined_figure(
+                    area_result,
+                    area_arrays,
+                    raw_arrays,
+                    output_path(add_prefix(f"{aa.base_output_name}_with_area_analysis"), ext),
+                    dpi=dpi,
+                    pixel_size_um=area_pixel_size_um,
+                )
+
+                if self.state.scale_bar_settings.enabled:
+                    pixel_size_um = self.get_pixel_size_um_for_output(aa.base_output_name)
+                    if pixel_size_um is None:
+                        raise ValueError(f"Scale-bar export is enabled, but no pixel size is available for area-analysis background '{aa.base_output_name}'.")
+                    self.save_area_analysis_combined_figure(
+                        area_result,
+                        area_arrays,
+                        raw_arrays,
+                        output_path(add_prefix(f"{aa.base_output_name}_with_area_analysis_and_scale"), ext),
+                        dpi=dpi,
+                        add_scale_bar=True,
+                        pixel_size_um=pixel_size_um,
+                    )
+
+        if self.state.area_analysis_settings.enabled and self.state.area_analysis_settings.detail_enabled:
+            detail=self.detail_area_result(area_result)
+            if self.state.save_csv:
+                self.save_area_analysis_csv(detail,output_path(add_prefix("detail_area_analysis"),"csv"))
+                self.save_area_regions_csv(self.detail_map_snapshot(area_arrays,raw_arrays),output_path(add_prefix("detail_regions"),"csv"))
+            if self.state.save_png:
+                self.save_detail_map_figure(area_arrays,raw_arrays,output_path(add_prefix("detail_map"),ext),dpi=dpi)
+                self.save_area_analysis_figure(detail,output_path(add_prefix("detail_chart"),ext),dpi=dpi)
+
+        tick("Word report and project file" if self.state.save_word else "Project file")
         project_path = output_path(add_prefix("Project"), PROJECT_EXTENSION)
-        report_path = output_path(add_prefix(REPORT_FILE_NAME), "docx")
-        with open(project_path, "w", encoding="utf-8") as f:
-            json.dump(project_dict(self.state), f, indent=2)
-        write_explanations_docx(self, report_path, written_files)
+        report_path = output_path(add_prefix(REPORT_FILE_NAME), "docx") if self.state.save_word else None
+        write_project_file(self.state, project_path)
+        if report_path is not None:
+            write_explanations_docx(self, report_path, written_files)
         if progress is not None:
             progress(total_steps, total_steps, "Finished")
         return project_path, report_path
@@ -3911,7 +6145,7 @@ ui = _UI()
 HELP_OVERVIEW = (
     "## How Elementti works\n"
     "Elementti turns the CSV files exported from SEM-EDS elemental mapping into publication-ready figures, ratio "
-    "maps, line profiles and processed CSV files, in eight steps. The steps are listed on the left; click a finished "
+    "maps, line profiles, area analyses and processed CSV files, in nine steps. The steps are listed on the left; click a finished "
     "step to go back to it, and Next brings you forward again.\n"
     "1. Files: choose the CSV files (one map per file), load the demo, or open a saved project.\n"
     "2. Names: give each file a short name such as Cl, Fe or Grey.\n"
@@ -3920,15 +6154,18 @@ HELP_OVERVIEW = (
     "5. Masking and noise removal (optional): hide background or pores, protect small values, replace values by a rule.\n"
     "6. Display: colour scales, colour bars and scale bars, with a live preview.\n"
     "7. Line profile (optional): values along a line drawn on a map.\n"
-    "8. Generate: choose the folder and save everything.\n"
+    "8. Area analysis (optional): mean values inside regions drawn on a map, to compare their composition.\n"
+    "9. Generate: choose the folder and save everything.\n"
     "The calculations are done in this order: rows and columns are removed, the scale factor is applied, "
     "low-value protection and then conditional replacement change the values, and the ratios and formulas are "
-    "calculated from the result. Greyscale masking only hides pixels in the figures; it never changes the values.")
+    "calculated from the result. Greyscale masking only hides pixels in the figures; it never changes the values. "
+    "In the area analysis, the masked pixels can be left out of the region values.")
 
 HELP_WORDS = (
     "## Words used\n"
     "Map: one CSV file, a table of numbers with one value per pixel.\n"
-    "Pixel size: the width of one pixel in µm; needed only for scale bars and for distances along a line profile.\n"
+    "Pixel size: the width of one pixel in µm; needed only for scale bars, for distances along a line profile "
+    "and for the area of a region.\n"
     "Scale factor: every value of a map is multiplied by it (for example 0.01 turns 250 into 2.5).\n"
     "Ratio: one map divided by another, pixel by pixel.\n"
     "Formula: a calculated map, such as (Cl + Fe) / O.\n"
@@ -3937,7 +6174,9 @@ HELP_WORDS = (
     "Colormap: the colour scale used for continuous values (for example viridis).\n"
     "Colour bar (guide bar): the bar next to a map that shows which colour means which value.\n"
     "Bins: value intervals with one colour each, instead of a continuous colour scale.\n"
-    "Line profile: the values of one or more outputs along a straight line drawn on a map.")
+    "Line profile: the values of one or more outputs along a straight line drawn on a map.\n"
+    "Area analysis: the mean values of one or more outputs inside regions drawn on a map (rectangle, square, "
+    "ellipse, polygon or freehand).")
 
 
 def _help_html(text: str) -> str:
@@ -4000,7 +6239,7 @@ METHOD_DETAILS = {
         "The pixel size (µm per pixel) is read from the information rows of the file when it is there, and any unit "
         "(nm, µm, mm, cm or m per pixel) is converted to µm:\n"
         "    1874.568 nm/pixel = 1.874568 µm/pixel        0.001874568 mm/pixel = 1.874568 µm/pixel\n"
-        "It is needed only for scale bars and for distances along a line profile.")),
+        "It is needed only for scale bars, for distances along a line profile and for the area of a region.")),
     "ratios_formulas": ("How ratios and formulas work", (
         "## Ratio maps\n"
         "A ratio is calculated pixel by pixel from the values after preprocessing, low-value protection and "
@@ -4021,7 +6260,9 @@ METHOD_DETAILS = {
         "## What it does\n"
         "A greyscale or reference image marks the pixels that should not be interpreted, for example background, "
         "pores or cracks. These pixels are hidden in the figures and drawn in the chosen mask colour. The values "
-        "themselves are not changed: the processed CSV files, ratios and formulas keep every pixel.\n"
+        "themselves are not changed: the processed CSV files, ratios and formulas keep every pixel. In the area "
+        "analysis (step 8) the masked pixels can be left out of the region values, so that pores or resin inside a "
+        "region do not pull its mean.\n"
         "## The conditions\n"
         "Each rule tests the scaled values of its source image (before low-value protection and conditional "
         "replacement). A pixel is masked when:\n"
@@ -4108,6 +6349,43 @@ METHOD_DETAILS = {
         "## Two y-axes\n"
         "When value maps and ratio-like outputs (ratios, and formulas that divide) are plotted together, the ratios "
         "use a second y-axis on the right, so both remain readable.")),
+    "area_analysis": ("How the area analysis works", (
+        "## Which pixels belong to a region\n"
+        "A region is drawn on the map as a rectangle, a square, an ellipse, a polygon or a freehand outline. "
+        "Positions are in pixels: pixel (x, y) is in column x and row y, counted from 0 at the top-left corner, and "
+        "its centre is at the whole numbers x and y. A pixel belongs to a region when its centre lies inside the "
+        "outline.\n"
+        "Example: a rectangle from (10, 20) to (49, 39) holds 40 × 20 = 800 pixels.\n"
+        "## Mean and spread\n"
+        "For every output, the values of the n pixels used are averaged; the spread is the sample standard "
+        "deviation:\n"
+        "    mean = (sum of the values) / n        SD = √( sum of (value − mean)² / (n − 1) )\n"
+        "Empty pixels (NaN) are always left out. Pixels hidden by greyscale masking (pores, resin, background) are "
+        "left out when 'Leave out masked pixels' is on. The values are those after preprocessing, low-value "
+        "protection and conditional replacement, as in the processed CSV files.\n"
+        "Example: Fe = 60, 62, 58 and 20 in a region, where the last pixel is a masked pore. With masked pixels left "
+        "out the mean is 60 and the SD is 2; with the pore included the mean is 50.\n"
+        "The median, minimum and maximum are saved in the CSV file as well.\n"
+        "## What the mean is, and what it is not\n"
+        "Every pixel counts equally. When the maps hold quantified values (atomic or weight percent in every "
+        "pixel), the region mean is the average of the pixel compositions. That is close to, but not the same as, "
+        "an area analysis in the microscope software, which quantifies the summed spectrum of the area. When the "
+        "maps hold counts, the mean is an intensity, not a composition.\n"
+        "## Normalising to 100\n"
+        "When this is on, the means of the selected element maps are rescaled so that they add up to 100:\n"
+        "    normalised mean = 100 × mean / (sum of the means of the selected element maps)\n"
+        "Example: Fe = 30, O = 15 and Cl = 5 become 60, 30 and 10. Ratios, formulas and greyscale images are not "
+        "part of the sum.\n"
+        "## Ratios\n"
+        "For a ratio map two numbers are saved: the mean of the pixel ratios, and the ratio of the region means,\n"
+        "    ratio of means = mean(numerator) / mean(denominator)\n"
+        "taken over the pixels where both maps have a value. The chart and the results table show the ratio of "
+        "means, because single pixels with a very small denominator can dominate the mean of the pixel ratios.\n"
+        "Example: Cl = 2.0, 0.5, 1.2 and Fe = 4.0, 0.1, 0.3 give the pixel ratios 0.5, 5 and 4 (mean 3.17), but a "
+        "ratio of means of 3.7 / 4.4 = 0.84.\n"
+        "## Area\n"
+        "    area = number of pixels in the region × (pixel size)²\n"
+        "Example: 1200 pixels at 1.874568 µm per pixel are 4217 µm².")),
 }
 
 
@@ -4125,7 +6403,8 @@ def how_button(parent, key: str, text: str = "How it works") -> QPushButton:
 
 # --- the step list on the left ----------------------------------------------
 
-STEP_NAMES = ["Files", "Names", "Outputs", "Preprocessing", "Masking and noise", "Display", "Line profile", "Generate"]
+STEP_NAMES = ["Files", "Names", "Outputs", "Preprocessing", "Masking and noise", "Display", "Line profile",
+              "Area analysis", "Generate"]
 
 
 def step_title(number: int, title: str) -> str:
@@ -4133,7 +6412,7 @@ def step_title(number: int, title: str) -> str:
 
 
 class StepList(QFrame):
-    """The eight steps on the left: done (click to go back), current, still to come."""
+    """The steps on the left: done (click to go back), current, still to come."""
 
     def __init__(self):
         super().__init__()
@@ -4171,7 +6450,7 @@ class StepList(QFrame):
             self.on_click(int(link[5:]))
 
     def show_state(self, current_step: int, skipped=()):
-        """current_step is 1..8 (0 = welcome page); skipped holds optional steps that were not used."""
+        """current_step is 1..9 (0 = welcome page); skipped holds optional steps that were not used."""
         for i, title in enumerate(STEP_NAMES):
             n = i + 1
             label = self.labels[i]
@@ -4222,7 +6501,7 @@ class Progress:
 # Projects: save every setting and open it again (also with other map files)
 # ===========================================================================
 
-PROJECT_FORMAT = 1
+PROJECT_FORMAT = 4
 PROJECT_EXTENSION = "elementti.json"
 
 
@@ -4243,17 +6522,23 @@ def project_dict(state: AppState) -> dict:
             "file_name": os.path.basename(path),
             "path": os.path.abspath(path),
             "settings": asdict(state.file_processing_settings.get(path, FileReadSettings())),
+            "source_identity": copy.deepcopy(state.source_fingerprints.get(source_key(path))),
         })
     lp = asdict(state.line_profile_settings)
     return {
         "app": APP_NAME,
         "app_version": APP_VERSION,
         "project_format": PROJECT_FORMAT,
+        "source_manifest": source_manifest(state),
+        "source_provenance": {"schema_version": 1, "dataset_id": state.source_dataset_id,
+            "mode": state.source_mode, "decisions": copy.deepcopy(state.source_decisions)},
         "saved": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "developer": APP_DEVELOPER_TEXT,
         "citation": APP_CITATION_TEXT,
         "demo": state.sample_data_mode == "demo",
         "files": files,
+        "acquisition_reference_index": (state.selected_file_paths.index(state.acquisition_reference_path)
+            if state.acquisition_reference_path in state.selected_file_paths else None),
         "selected_maps": list(state.selected_maps),
         "selected_ratios": [{"numerator": n, "denominator": d} for n, d in state.selected_ratios],
         "selected_formulas": [asdict(f) for f in state.selected_formulas],
@@ -4261,11 +6546,13 @@ def project_dict(state: AppState) -> dict:
         "display_settings": {name: asdict(s) for name, s in state.display_settings.items()},
         "scale_bar_settings": asdict(state.scale_bar_settings),
         "line_profile_settings": lp,
+        "area_analysis_settings": asdict(state.area_analysis_settings),
         "output_options": {
             "output_folder": state.output_folder,
             "project_name": state.project_name,
             "save_figures": state.save_png,
             "save_csv": state.save_csv,
+            "save_word": state.save_word,
             "figure_format": state.figure_format,
             "figure_dpi": state.figure_dpi,
         },
@@ -4286,19 +6573,41 @@ def read_project_file(path: str) -> dict:
         raise ValueError("This project was saved by a newer version of Elementti. Please use that version to open it.")
     if not data["files"]:
         raise ValueError("The project has no map files.")
+    for entry in data["files"]:
+        identity = entry.get("source_identity")
+        if identity is not None and not valid_source_identity(identity):
+            raise ValueError("A saved source-file fingerprint is invalid. The original data cannot be verified from this project.")
     return data
 
 
-def state_from_project(data: dict, paths: List[str]) -> AppState:
+def state_from_project(data: dict, paths: List[str], use_as_template=False) -> AppState:
     """A new AppState with the saved settings, using `paths` for the map files (in the saved order)."""
     files = data["files"]
     if len(paths) != len(files):
         raise ValueError("Every map of the project needs one file.")
     st = AppState()
+    provenance = data.get("source_provenance") or {}
+    if not isinstance(provenance, dict) or not isinstance(provenance.get("decisions", []), list):
+        raise ValueError("The saved source history is invalid.")
+    if not all(isinstance(event, dict) for event in provenance.get("decisions", [])):
+        raise ValueError("The saved source decisions are invalid.")
+    if not use_as_template:
+        st.source_dataset_id = str(provenance.get("dataset_id") or st.source_dataset_id)
+        st.source_decisions = copy.deepcopy(provenance.get("decisions", []))
+        st.source_mode = "original" if all(valid_source_identity(entry.get("source_identity")) for entry in files) else "legacy"
+    else:
+        st.source_mode = "template"
     for entry, path in zip(files, paths):
+        if not use_as_template and entry.get("source_identity") is not None:
+            if not valid_source_identity(entry["source_identity"]):
+                raise ValueError("A saved source-file fingerprint is invalid.")
+            st.source_fingerprints[source_key(path)] = copy.deepcopy(entry["source_identity"])
         st.selected_file_paths.append(path)
         st.renamed_names_by_path[path] = str(entry.get("name", "")).strip() or suggest_name(os.path.basename(path), set())
         st.file_processing_settings[path] = _dataclass_from(FileReadSettings, entry.get("settings", {}))
+    reference_index = data.get("acquisition_reference_index")
+    if isinstance(reference_index, int) and not isinstance(reference_index, bool) and 0 <= reference_index < len(paths):
+        st.acquisition_reference_path = paths[reference_index]
     st.selected_maps = [str(n) for n in data.get("selected_maps", [])]
     st.selected_ratios = [(str(r["numerator"]), str(r["denominator"])) for r in data.get("selected_ratios", [])]
     st.selected_formulas = [_dataclass_from(FormulaOutput, f) for f in data.get("selected_formulas", [])]
@@ -4321,11 +6630,33 @@ def state_from_project(data: dict, paths: List[str]) -> AppState:
     lp.curve_settings = {str(k): _dataclass_from(LineProfileCurveSettings, v) for k, v in curves.items()}
     st.line_profile_settings = lp
 
+    aa_data = dict(data.get("area_analysis_settings", {}) or {})       # absent in projects saved before 1.1.1
+    saved_regions = aa_data.pop("regions", []) or []
+    aa = _dataclass_from(AreaAnalysisSettings, aa_data)
+    if "use_processed_values" not in aa_data:
+        aa.use_processed_values = True
+
+    aa.selected_output_names = [str(n) for n in (aa.selected_output_names or [])]
+    aa.regions = []
+    for saved in saved_regions:
+        region = _dataclass_from(AreaRegion, saved)
+        region.shape = normalize_area_shape(region.shape)
+        region.points = [[float(x), float(y)] for x, y in area_points_array(region.points)]
+        aa.regions.append(region)
+    ensure_unique_region_colors(aa.regions)
+    st.area_analysis_settings = aa
+    if aa.regions and not aa.grid_signature:
+        legacy_engine = ProcessingEngine(st)
+        source_grids = {name: area_crop_settings(st.file_processing_settings[path]) for name, path in st.get_named_files().items()}
+        base_sources = legacy_engine.area_input_names(aa.base_output_name)
+        aa.grid_signature = dict(background=source_grids[base_sources[0]] if base_sources else {}, input_grids=source_grids)
+
     out = data.get("output_options", {}) or {}
     st.output_folder = str(out.get("output_folder", "") or "")
     st.project_name = str(out.get("project_name", "") or "")
     st.save_png = bool(out.get("save_figures", True))
     st.save_csv = bool(out.get("save_csv", True))
+    st.save_word = bool(out.get("save_word", True))
     st.figure_format = str(out.get("figure_format", "png") or "png")
     try:
         st.figure_dpi = int(out.get("figure_dpi", 300))
@@ -4475,9 +6806,68 @@ def _md(inner, beg="(", end=")") -> str:
     return f"<m:d>{pr}<m:e>{inner}</m:e></m:d>"
 
 
+class SourceReviewDialog(QDialog):
+    """Display source changes before adopting a different baseline."""
+    def __init__(self, rows, parent=None, opening=False):
+        super().__init__(parent)
+        self.rows = rows
+        self.setWindowTitle("Review source files")
+        self.resize(1100, 490)
+        layout = QVBoxLayout(self)
+        changed = any(row["status"] == "Changed" for row in rows)
+        unverified = any(row["status"] == "Unverified" for row in rows)
+        missing = any(row["status"] in ("Missing", "Unreadable") for row in rows)
+        text = ("Changed files contain different bytes from the accepted sources. Accepting them records a new baseline and a decision; "
+                "it does not reproduce the previous input data." if changed else
+                "Some files have no saved fingerprints. Their earlier contents cannot be verified. "
+                "You can record the current files as a baseline for future checks." if unverified else
+                "All available files match their accepted content fingerprints.")
+        if missing:
+            text = "Some source files are missing or unreadable. Locate them before continuing."
+        label = QLabel(text)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.table = QTableWidget(len(rows), 5)
+        self.table.setHorizontalHeaderLabels(["Map", "Current file", "Status", "Reference SHA-256", "Current SHA-256"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        for i, row in enumerate(rows):
+            expected = row["expected"] or {}
+            current = row["current"] or {}
+            values = [row["name"], os.path.basename(row["path"]), row["status"],
+                expected.get("sha256", "Not recorded"), current.get("sha256", "Unavailable")]
+            for j, value in enumerate(values):
+                item = QTableWidgetItem(value[:16] + "…" if j >= 3 and len(value) == 64 else value)
+                item.setToolTip(str(value) + ("\n" + row["message"] if row["message"] else ""))
+                self.table.setItem(i, j, item)
+        layout.addWidget(self.table)
+        self.reason_edit = QLineEdit()
+        self.reason_edit.setPlaceholderText("Optional note explaining the accepted change")
+        self.reason_edit.setVisible(changed or unverified)
+        layout.addWidget(self.reason_edit)
+        buttons = QDialogButtonBox()
+        if changed or unverified:
+            self.accept_button = buttons.addButton("Use these changed files" if changed else "Use current files as baseline", QDialogButtonBox.AcceptRole)
+            self.accept_button.setEnabled(not missing)
+            buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        else:
+            self.accept_button = None
+            buttons.addButton("Continue" if opening and not missing else "Close", QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def reason(self):
+        return self.reason_edit.text().strip() or "The source-file comparison was reviewed and the displayed current files were explicitly accepted."
+
+
+
 class _DxDoc:
     def __init__(self):
         self.body = []
+        self.media = []
 
     def para(self, content="", style=None, keep_next=False, indent=None, after=None, align=None):
         ppr = []
@@ -4535,6 +6925,33 @@ class _DxDoc:
         self.body.append("".join(out))
         self.para("", after=60)
 
+    def picture(self, png, caption):
+        import struct
+        if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Report figures must be PNG images.")
+        width, height = struct.unpack(">II", png[16:24])
+        if width <= 0 or height <= 0:
+            raise ValueError("Report image dimensions are invalid.")
+        index = len(self.media) + 1
+        self.media.append(png)
+        scale = min(_DX_TEXT_W * 635 / width, 4.65 * 914400 / height)
+        cx, cy = round(width * scale), round(height * scale)
+        label = _dx_esc(caption)
+        drawing = (
+            '<w:p><w:pPr><w:keepNext/><w:jc w:val="center"/><w:spacing w:before="100" w:after="40"/></w:pPr><w:r><w:drawing>'
+            '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0">'
+            f'<wp:extent cx="{cx}" cy="{cy}"/><wp:docPr id="{index}" name="Figure {index}" descr="{label}"/>'
+            '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            f'<pic:nvPicPr><pic:cNvPr id="0" name="figure{index}.png"/><pic:cNvPicPr/></pic:nvPicPr>'
+            f'<pic:blipFill><a:blip r:embed="rIdImage{index}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+            f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>'
+            '</wp:inline></w:drawing></w:r></w:p>')
+        self.body.append(drawing)
+        self.para(f"Figure {index}. {caption}", style="Caption")
+
+
     def save(self, path, title):
         import zipfile
         sect = (f'<w:sectPr><w:footerReference w:type="default" r:id="rIdFooter"/>'
@@ -4548,8 +6965,7 @@ class _DxDoc:
                   f'<w:p><w:pPr><w:pStyle w:val="Footer"/></w:pPr>{_dx_runs(title)}'
                   '<w:r><w:t xml:space="preserve">   |   page </w:t></w:r>'
                   '<w:fldSimple w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple>'
-                  '<w:r><w:t xml:space="preserve"> of </w:t></w:r>'
-                  '<w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:ftr>')
+                  '</w:p></w:ftr>')
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         files = {
             "[Content_Types].xml": (
@@ -4557,6 +6973,7 @@ class _DxDoc:
                 '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
                 '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
                 '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Default Extension="png" ContentType="image/png"/>'
                 '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
                 '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
                 '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
@@ -4599,9 +7016,25 @@ class _DxDoc:
                 '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
                 f"<Application>{_dx_esc(APP_NAME)}</Application></Properties>"),
         }
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-            for name, data in files.items():
-                z.writestr(name, data.encode("utf-8"))
+        relationships = "".join(
+            f'<Relationship Id="rIdImage{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/figure{i}.png"/>'
+            for i in range(1, len(self.media)+1))
+        files["word/_rels/document.xml.rels"] = files["word/_rels/document.xml.rels"].replace("</Relationships>", relationships + "</Relationships>")
+        for i, png in enumerate(self.media, 1):
+            files[f"word/media/figure{i}.png"] = png
+        temporary = None
+        try:
+            descriptor, temporary = tempfile.mkstemp(prefix=".elementti_word_", suffix=".docx", dir=os.path.dirname(os.path.abspath(path)))
+            os.close(descriptor)
+            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as z:
+                for name, data in files.items():
+                    z.writestr(name, data.encode("utf-8") if isinstance(data, str) else data)
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:os.unlink(temporary)
+                except OSError:pass
 
 
 _DX_STYLES = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4624,6 +7057,8 @@ _DX_STYLES = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:pPr><w:spacing w:before="40" w:after="100"/><w:ind w:left="567"/></w:pPr><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Methods"><w:name w:val="Methods text"/><w:basedOn w:val="Normal"/><w:qFormat/>
 <w:pPr><w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="9FB7D3"/></w:pBdr><w:ind w:left="300"/><w:spacing w:after="160"/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="Caption"/><w:basedOn w:val="Normal"/>
+<w:pPr><w:spacing w:after="140"/><w:keepLines/></w:pPr><w:rPr><w:color w:val="000000"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Footer"><w:name w:val="footer"/><w:basedOn w:val="Normal"/>
 <w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:color w:val="7F7F7F"/><w:sz w:val="16"/><w:szCs w:val="16"/></w:rPr></w:style>
 </w:styles>'''
@@ -4763,6 +7198,8 @@ def methods_paragraph(engine, record) -> str:
         parts.append(f"A line profile of {', '.join(lp.selected_output_names)} was taken along a straight line on the "
                      f"{lp.base_output_name} map, using the nearest pixel at steps of about one pixel"
                      + ("" if lp.normalize_mode.strip().lower() == "raw values" else f" ({lp.normalize_mode.lower()})") + ".")
+    if st.area_analysis_settings.enabled:
+        parts.append(engine.area_analysis_description())
     return " ".join(p for p in parts if p)
 
 
@@ -4775,7 +7212,7 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
     doc.para(f"{APP_NAME}, {datetime.now().strftime('%d %B %Y')}" + (", demo data" if st.sample_data_mode == "demo" else ""),
              style="Subtitle")
     doc.para("This document explains every step that turned the CSV files into the figures and files of this run, with "
-             "the settings used and what each step changed. Section 9 is a short description of the run that can be "
+             "the settings used and what each step changed. Section 10 is a short description of the run that can be "
              "adapted for the methods section of a paper.")
 
     # 1. outputs
@@ -4805,6 +7242,7 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
         rows.append([name, os.path.basename(file_path), _rows_text(s.manual_rows), _rows_text(s.manual_columns),
                      str(s.scale_factor), str(s.pixel_size_um).strip() or "not given", f"{shape[0]} × {shape[1]}"])
     doc.table(rows, [1100, 2300, 1300, 1300, 1000, 1200, 1200])
+    write_source_provenance_docx(doc, engine)
     doc.lead("The listed rows and columns (numbered from 1) were removed, every remaining cell was read as a number (an empty "
              "cell becomes an empty pixel), and every value was multiplied by the scale factor of its file:")
     doc.math(_mt("value used = value in the file × scale factor"))
@@ -4856,7 +7294,7 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
     # 5. masks
     doc.heading(1, "5  Greyscale masking")
     if record["masks"]:
-        doc.para("Masking only hides pixels in the figures, drawn in the mask colour; it does not change any value, CSV "
+        doc.para("Masking hides pixels in the figures, drawn in the mask colour; it does not change any value, CSV "
                  "file, ratio or formula. Each rule tested the scaled values of its source image (before section 3).")
         rows = [["Rule", "Masked where", "Applied to", "Colour", "Pixels masked"]]
         for i, (rule, count, total) in enumerate(record["masks"], start=1):
@@ -4889,6 +7327,10 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
     doc.math(_mt("position") + _mt(" = ") + _mf(_mt("value − lower limit"), _mt("upper limit − lower limit")))
     doc.para("Manual bins: a value gets the colour of the interval boundary(k) ≤ value < boundary(k + 1); values below the "
              "first boundary get the first colour and values at or above the last boundary the last colour.")
+
+    for name in st.get_output_names():
+        figure = output_report_image(engine, name, record)
+        doc.picture(figure["png"], figure["caption"])
 
     # 7. scale bars
     doc.heading(1, "7  Scale bars")
@@ -4923,20 +7365,82 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
                  f"{lp.end_y:.1f}) pixels, {length:.2f} pixels long" + (f" ({engine.format_line_length_label(length * px)})" if px else "")
                  + f", sampled at {points} equally spaced points; at each point the nearest pixel was used.")
         doc.math([_mt("L = ") + f"<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>{_mt('Δx² + Δy²')}</m:e></m:rad>",
-                  _mt("points = ⌈L⌉ + 1")])
+                  _mt("points = ") + _md(_mt("L"), beg="⌈", end="⌉") + _mt(" + 1")])
         doc.para(f"Outputs: {', '.join(lp.selected_output_names)}. Values: {lp.normalize_mode.lower()}"
                  + (" (value − minimum) / (maximum − minimum) along the line." if lp.normalize_mode.strip().lower() == "normalize 0-1" else
                     " (value / maximum along the line)." if lp.normalize_mode.strip().lower() == "normalize by maximum" else "."))
+        figure = line_report_image(engine, record)
+        doc.picture(figure["png"], figure["caption"])
     else:
         doc.para("No line profile in this run.")
 
-    # 9. methods text
-    doc.heading(1, "9  Description for a methods section")
+    # 9. area analysis
+    doc.heading(1, "9  Area analysis")
+    aa = st.area_analysis_settings
+    if aa.enabled:
+        area_arrays = engine.prepare_area_arrays(record["raw"])
+        area_result = engine.compute_area_analysis(area_arrays, record["raw"])
+        doc.para(engine.area_analysis_description(area_result))
+        figure = area_report_image(engine, area_result, area_arrays, record["raw"])
+        doc.picture(figure["png"], figure["caption"])
+        if aa.detail_enabled:
+            detail=engine.detail_area_result(area_result)
+            figure = area_report_image(engine, detail, area_arrays, record["raw"])
+            doc.picture(figure["png"], figure["caption"])
+            x0,x1,y0,y1=detail["viewport_bounds"]
+            doc.para(f"The linked detail view used x = {x0:g} to {x1:g}, y = {y0:g} to {y1:g} in original image pixel coordinates. "
+                     f"Region selection: {aa.detail_region_mode}. Its chart included: " + ", ".join(r["name"] for r in detail["regions"]) +
+                     ". These are whole-region statistics, including any pixels outside the displayed detail window.")
+        doc.para(f"Background: {aa.base_output_name}. Coordinates use pixel centres, x rightwards and y downwards from (0, 0) at the top left. "
+                 "Image dimensions, removed rows/columns and known pixel sizes were checked across map dependencies. "
+                 "The user must ensure the maps describe the same registered field of view.")
+        rows=[["Region", "Shape", "Selected pixels", "Selected area", "Common pixels used"]]
+        for r in area_result["regions"]:
+            rows.append([r["name"],r["shape"],str(r["pixels"]),format_area_um2(r["area_um2"]) or "not calibrated",
+                         str(r["common_pixels_used"]) if r["common_pixels_used"] is not None else "per output"])
+        doc.table(rows,[2200,1400,1600,2300,1500])
+        rows=[["Output", "Unit", "Declared type", "Applied scale factor"]]
+        for name in area_result["selected_output_names"]:
+            u=area_result["units"][name]
+            rows.append([name,u["unit"],u["data_type"],str(u["scale_factor"])])
+            if u["warning"]:doc.para(f"{name}: {u['warning']}")
+        doc.table(rows,[2200,1600,3400,1800])
+        for r in area_result["regions"]:
+            doc.heading(2,r["name"])
+            rows=[["Output", "Displayed value", "Statistic", "Pixels used", "Used area"]]
+            for name in area_result["selected_output_names"]:
+                e=r["stats"][name]
+                shown=_n(e["value"],6) if e["value"] is not None else "n/a"
+                rows.append([name,shown,e["value_kind"],str(e["display_pixels_used"]),format_area_um2(e["display_area_um2"]) or "not calibrated"])
+            doc.table(rows,[2000,1700,2400,1300,1600])
+            rows=[["Output", "Pixel mean ± SD", "Pixel-statistics n", "Masked / nonfinite / undefined"]]
+            for name in area_result["selected_output_names"]:
+                e=r["stats"][name]
+                spread=_n(e["sd"],4) if e["sd"] is not None else "n/a"
+                mean=_n(e["mean"],6) if e["mean"] is not None else "n/a"
+                rows.append([name,f"{mean} ± {spread}",str(e["pixels_used"]),f"{e['pixels_masked']} / {e['pixels_empty']} / {e['pixels_undefined']}"])
+            doc.table(rows,[2000,2400,1900,2700])
+        if aa.normalize_to_100:
+            doc.para("Relative composition was calculated only for " + ", ".join(area_result["normalization_names"]) +
+                     ". These proportions sum to 100% among the selected elements. They are not the original full-composition percentages. "
+                     "The original mean and sample SD remain available in the CSV. Scaled spatial SD is not propagated measurement uncertainty.")
+        doc.para("For ratios, the displayed statistic is the ratio of means on finite paired numerator/denominator pixels. "
+                 "Pixel ratios with a zero denominator are undefined and have a separate count. If the mean denominator is zero, the ratio of means is n/a; it is not replaced with a different statistic.")
+        doc.para("The selected area includes every pixel centre in the outline. Used area includes only the pixels used for the stated statistic. "
+                 "Both are pixel count multiplied by squared pixel size when all inputs and the background have matching calibration.")
+        if st.save_csv:
+            doc.para("area_analysis.csv contains units, data basis, displayed values and counts, all pixel statistics and separate ratio counts. "
+                     "area_analysis_regions.csv and the project retain the full outlines. The project also records the grid assigned to those outlines.")
+    else:
+        doc.para("No area analysis in this run.")
+
+    # 10. methods text
+    doc.heading(1, "10  Description for a methods section")
     doc.para("Adapt this text as needed; [ref] is the Elementti article below.")
     doc.para(methods_paragraph(engine, record), style="Methods")
 
-    # 10. files and citation
-    doc.heading(1, "10  Files of this run")
+    # 11. files and citation
+    doc.heading(1, "11  Files of this run")
     for f in written_files:
         doc.bullet(os.path.basename(f))
     doc.heading(1, "How to cite Elementti")
@@ -4952,7 +7456,7 @@ def write_explanations_docx(engine, path: str, written_files: List[str]) -> str:
 # It is built with PyInstaller, which is installed with pip the first time (internet needed once).
 # If a code-signing certificate is installed on the building computer (Windows), the program is signed
 # automatically; otherwise it is left unsigned.
-#     python Elementti_1_1_0.py --make-exe
+#     python Elementti_1_1_1.py --make-exe
 
 import glob as _glob
 import importlib.util as _importlib_util
@@ -5069,11 +7573,14 @@ def build_exe(script=None, log=None, icon=None, out_dir=None):
         raise RuntimeError("The Python file of Elementti was not found.")
     target = exe_path(script, out_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
+    if _importlib_util.find_spec("openpyxl") is None:
+        raise RuntimeError("Building Elementti with Excel reports requires openpyxl.\n\npython -m pip install openpyxl")
     ensure_pyinstaller(say)
     with tempfile.TemporaryDirectory(prefix="elementti_build_") as tmp:
         tmp = Path(tmp)
         cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
-               "--name", EXE_BASENAME, "--distpath", tmp / "dist", "--workpath", tmp / "work", "--specpath", tmp]
+               "--name", EXE_BASENAME, "--distpath", tmp / "dist", "--workpath", tmp / "work", "--specpath", tmp,
+               "--hidden-import", "openpyxl"]
         ico = icon if icon is not None else icon_bytes()
         if ico:
             (tmp / "elementti.ico").write_bytes(ico)
@@ -5095,7 +7602,7 @@ def build_exe(script=None, log=None, icon=None, out_dir=None):
 
 
 def make_exe_cli() -> int:
-    """`python Elementti_1_1_0.py --make-exe [folder]`: build with progress printed to the console."""
+    """`python Elementti_1_1_1.py --make-exe [folder]`: build with progress printed to the console."""
     args = [a for a in sys.argv[1:] if a != "--make-exe"]
     path, note = build_exe(log=lambda text: print(text, flush=True), out_dir=args[0] if args else None)
     print(f"\nDone: {path}\n{note}")
@@ -5179,7 +7686,359 @@ class WelcomePage(QWizardPage):
         self.setLayout(outer)
 
 
+# Suggestions are read-only until the researcher explicitly applies them.
+def inspect_import_file(path, state):
+    with open(path, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        raw = stream.read()
+        after = os.fstat(stream.fileno())
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(raw) != after.st_size:
+        raise ValueError('The file changed during inspection. Inspect it again after writing finishes.')
+    # Checking a proposal must not accept a new baseline or alter cached analysis values.
+    checked = copy.deepcopy(state)
+    bind_source_bytes(checked, path, raw)
+    text = raw.decode('utf-8-sig', errors='replace').replace('\ufffd', ' ').replace('\xa0', ' ')
+    rows = [[cell.strip() for cell in row] for row in csv.reader(io.StringIO(text))]
+    metadata = {}
+    def numeric(cell):
+        try:
+            float(cell)
+            return bool(cell.strip())
+        except (ValueError, TypeError):
+            return False
+    start = None
+    offset = 0
+    for index, row in enumerate(rows):
+        if row and all(numeric(cell) for cell in row):
+            start = index
+            break
+        if len(row) >= 3 and not numeric(row[0]) and all(numeric(cell) for cell in row[1:]):
+            # A label column is only accepted later if every data row has it.
+            start, offset = index, 1
+            break
+        if len(row) >= 2:
+            metadata[re.sub(r'\s+', ' ', row[0].lower().strip())] = ' '.join(row[1:]).strip()
+    info = dict(path=path, metadata=metadata, shape=None, header=None, columns=None,
+                scale=None, pixel=None, issues=[], sha256=hashlib.sha256(raw).hexdigest(),
+                size_bytes=len(raw))
+    def dimension(keys):
+        for key in keys:
+            if key in metadata:
+                try:
+                    value = int(metadata[key])
+                    if value > 0:return value
+                except ValueError:pass
+                info['issues'].append('Invalid declared dimension: ' + key)
+        return None
+    nx = dimension(('number x pixels', 'columns', 'width'))
+    ny = dimension(('number y pixels', 'rows', 'height'))
+    if start is not None:
+        data = rows[start:]
+        width = len(data[0])
+        if not offset and nx is not None and width == nx + 1:
+            # A numeric index column is accepted only with declared dimensions and a full sequence.
+            indices = [row[0] for row in data if len(row) == width]
+            if len(indices) == len(data) and all(numeric(v) for v in indices):
+                values = [float(v) for v in indices]
+                if values == list(range(len(data))) or values == list(range(1, len(data) + 1)):
+                    offset = 1
+        valid = all(len(row) == width and all(numeric(cell) for cell in row[offset:]) for row in data)
+        if offset and nx is None:
+            valid = valid and all(not numeric(row[0]) for row in data)
+        shape = (len(data), width - offset)
+        if valid and shape[1] > 0 and (nx is None or shape[1] == nx) and (ny is None or shape[0] == ny):
+            info.update(shape=shape, header=start, columns=offset)
+        else:
+            info['issues'].append('No verified rectangular grid: check dimensions, blank cells, labels, or footer rows manually.')
+    else:
+        info['issues'].append('No numeric map grid recognized; retain manual row/column settings.')
+    declared = metadata.get('data type', '')
+    kind = re.sub(r'\s+', '', declared.lower()).replace('×', 'x').replace('*', 'x')
+    match = re.fullmatch(r'(?:at%|wt%|atomic%|weight%|atomicpercent|weightpercent)(?:x([0-9]+(?:\.[0-9]+)?))?', kind)
+    if match:
+        multiplier = float(match.group(1) or '1')
+        if multiplier > 0:info['scale'] = format_detected_float(1.0 / multiplier)
+    elif kind in ('video', 'counts', 'count', 'intensity', 'rawcounts', 'netcounts'):
+        info['scale'] = '1'
+    if info['scale'] is None:
+        info['issues'].append('Scale factor unknown: data type does not explicitly state a supported unit/multiplier.')
+    pixel_values = []
+    for key, value in metadata.items():
+        if re.fullmatch(r'pixel\s*(?:size|width|height)(?:\s*\([^)]*\)|\s*\[[^]]*\])?', key):
+            # Units must be explicit; a bare number is not sufficient for a suggestion.
+            combined = key + ' ' + value
+            unit = re.search(r'(?<![A-Za-z])(nm|um|µm|μm|mm|cm|m)(?![A-Za-z])', combined, re.I)
+            number = re.search(r'[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', value)
+            if unit and number:
+                try:
+                    pixel = parse_pixel_size_text_to_um(number.group() + ' ' + unit.group(), 'Detected pixel size')
+                    if np.isfinite(pixel) and pixel > 0:pixel_values.append(pixel)
+                except ValueError:pass
+    if pixel_values and all(np.isclose(pixel_values[0], p, rtol=1e-6, atol=0) for p in pixel_values):
+        info['pixel'] = format_detected_float(pixel_values[0])
+    else:
+        info['issues'].append('Pixel size needs review: missing units, missing value, or conflicting X/Y calibration.')
+    return info
+
+
+def inspect_import_files(paths, state):
+    result = []
+    for path in paths:
+        try:
+            result.append(inspect_import_file(path, state))
+        except (OSError, ValueError, csv.Error) as error:
+            result.append(dict(path=path, error=str(error), issues=[str(error)], metadata={}, shape=None,
+                               header=None, columns=None, scale=None, pixel=None))
+    return result
+
+
+def verify_suggestion_sources(infos):
+    for info in infos:
+        current = fingerprint_source_file(info['path'])
+        if current['sha256'] != info.get('sha256') or current['size_bytes'] != info.get('size_bytes'):
+            raise ValueError('A source changed while suggestions were open. Close this window and review the source files.')
+
+
+def propose_acquisition_groups(infos):
+    groups = {}
+    for info in infos:
+        meta = info['metadata']
+        path = info['path']
+        stem = unicodedata.normalize('NFKC', os.path.splitext(os.path.basename(path))[0])
+        label = unicodedata.normalize('NFKC', meta.get('image name', '')).strip()
+        if meta.get('data type', '').strip().lower() == 'video':
+            reference_suffix = re.search(r'(?:^|[_ -])(Grey|Gray|Greyscale|Grayscale|BSE|SE)$', stem, re.I)
+            if reference_suffix:label = reference_suffix.group(1)
+        acquisition = next((meta[k] for k in ('acquisition id', 'scan id', 'map id') if meta.get(k)), '')
+        basis = 'Acquisition identifier in metadata'
+        if not acquisition:
+            # Remove only the exact channel label supplied by the file itself.
+            prefix = stem
+            if label and stem.lower().endswith(label.lower()):
+                prefix = stem[:-len(label)].rstrip(' _-')
+                prefix = re.sub(r'(?:[_ -](?:AtomicPct|WeightPct|Counts|Intensity|Video))+$', '', prefix, flags=re.I)
+            if label and prefix != stem and prefix:
+                acquisition = prefix
+                basis = 'Shared filename prefix; verify acquisition'
+            else:
+                acquisition = stem
+                basis = 'Uncertain: no shared acquisition identifier recognized'
+        group_key = (os.path.normcase(os.path.abspath(os.path.dirname(path))), acquisition.casefold())
+        group = groups.setdefault(group_key, dict(name=acquisition, infos=[], basis=basis, issues=[]))
+        group['infos'].append(info)
+    for group in groups.values():
+        members = group['infos']
+        shapes = {info['shape'] for info in members if info['shape'] is not None}
+        pixels = [float(info['pixel']) for info in members if info.get('pixel')]
+        refs = [info for info in members if info['metadata'].get('data type', '').strip().lower() == 'video'
+                or is_grayscale_name(info['metadata'].get('image name', ''))]
+        group['references'] = [info['path'] for info in refs]
+        if len(shapes) > 1:group['issues'].append('Conflicting map dimensions')
+        if any(info['shape'] is None for info in members):group['issues'].append('Unverified map dimensions')
+        if pixels and any(not np.isclose(pixels[0], p, rtol=1e-6, atol=0) for p in pixels):
+            group['issues'].append('Conflicting pixel sizes')
+        if any(not info.get('pixel') for info in members):group['issues'].append('Missing or uncertain pixel size')
+        if len(refs) != 1:group['issues'].append('No reference image found' if not refs else 'Multiple possible reference images')
+        if len(members) == 1:group['issues'].append('Only one file matched')
+    return list(groups.values())
+
+
+class ImportSuggestionsDialog(QDialog):
+    def __init__(self, page, infos):
+        super().__init__(page)
+        self.page, self.infos = page, infos
+        self.setWindowTitle('Review import suggestions')
+        self.resize(1080, 590)
+        layout = QVBoxLayout(self)
+        intro = QLabel('Check only the settings you want to replace. Current table edits are preserved for every unchecked setting. '
+                       'Unknown settings have no proposed value. You can edit applied values afterward.')
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(['Apply', 'File / setting', 'Current value', 'Suggested value', 'Evidence / review'])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.verticalHeader().hide()
+        self.changes = []
+        for row, info in enumerate(infos):
+            name = page.table.item(row, 0).text()
+            proposals = [
+                (1, 'Rows to remove', None if info['header'] is None else (f"[1-{info['header']}]" if info['header'] else ''),
+                 'Verified numeric grid: ' + str(info['shape'])),
+                (2, 'Columns to remove', None if info['columns'] is None else ('1' if info['columns'] else ''),
+                 'Verified grid and label/index column'),
+                (3, 'Scale factor', info['scale'], 'Data Type: ' + info['metadata'].get('data type', 'unknown')),
+                (4, 'Pixel size (µm/pixel)', info['pixel'], 'Explicit pixel-size unit converted to µm/pixel'),
+            ]
+            for column, title, value, evidence in proposals:
+                index = self.table.rowCount();self.table.insertRow(index)
+                check = QCheckBox();check.setEnabled(value is not None and not info.get('error'))
+                self.table.setCellWidget(index, 0, check)
+                old = page.table.cellWidget(row, column).text()
+                for col, content in enumerate([name + ' / ' + title, old or '(blank)',
+                        '(unknown)' if value is None else value or '(blank)',
+                        '; '.join(info['issues']) if value is None else evidence], 1):
+                    item = QTableWidgetItem(content);item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    item.setToolTip(info['path'] + '\n' + content);self.table.setItem(index, col, item)
+                self.changes.append((check, row, column, value, info))
+        layout.addWidget(self.table)
+        actions = QHBoxLayout()
+        self.all_button = QPushButton('Check available suggestions')
+        self.clear_button = QPushButton('Clear checks')
+        self.all_button.clicked.connect(lambda: self.check_available(True))
+        self.clear_button.clicked.connect(lambda: self.check_available(False))
+        actions.addWidget(self.all_button);actions.addWidget(self.clear_button);actions.addStretch();layout.addLayout(actions)
+        self.status = QLabel('Nothing changes until you click Apply.');self.status.setWordWrap(True);layout.addWidget(self.status)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.apply_button = buttons.addButton('Apply checked settings', QDialogButtonBox.AcceptRole)
+        self.apply_button.setEnabled(False)
+        for check, *_ in self.changes:check.toggled.connect(self.update_apply)
+        buttons.accepted.connect(self.apply_changes);buttons.rejected.connect(self.reject);layout.addWidget(buttons)
+
+    def check_available(self, checked):
+        for check, *_ in self.changes:check.setChecked(checked and check.isEnabled())
+
+    def update_apply(self):
+        self.apply_button.setEnabled(any(check.isEnabled() and check.isChecked() for check, *_ in self.changes))
+
+    def apply_changes(self):
+        selected = [change for change in self.changes if change[0].isEnabled() and change[0].isChecked()]
+        if not selected:return
+        try:
+            infos = {info['path']: info for _, _, _, _, info in selected}
+            verify_suggestion_sources(infos.values())
+        except (OSError, ValueError) as error:
+            self.status.setText(str(error));return
+        for _, row, column, value, _ in selected:self.page.table.cellWidget(row, column).setText(value)
+        self.page.status_label.setText(f'{len(selected)} import suggestions applied. Review the values, then click Next.')
+        self.accept()
+
+
+class AcquisitionGroupsDialog(QDialog):
+    def __init__(self, page, infos):
+        super().__init__(page)
+        self.page, self.infos = page, infos
+        self.groups = propose_acquisition_groups(infos)
+        self.setWindowTitle('Review acquisition groups')
+        self.resize(1000, 620)
+        layout = QVBoxLayout(self)
+        intro = QLabel('Choose a proposed acquisition, review its checked files and reference image, then use that selection. '
+                       'You can tick additional files or untick incorrect matches. Changing the active files resets later analysis selections. '
+                       'Other files remain available in this window during this session; saved projects contain the active selection.')
+        intro.setWordWrap(True);layout.addWidget(intro)
+        self.group_combo = QComboBox()
+        for i, group in enumerate(self.groups):
+            self.group_combo.addItem(f"{group['name']} ({len(group['infos'])} files)", i)
+        layout.addWidget(self.group_combo)
+        self.summary = QLabel('');self.summary.setWordWrap(True);layout.addWidget(self.summary)
+        self.table = QTableWidget(len(infos), 5)
+        self.table.setHorizontalHeaderLabels(['Use', 'File', 'Map dimensions', 'Pixel size (µm/pixel)', 'Suggested group / review'])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.verticalHeader().hide()
+        self.checks = []
+        for row, info in enumerate(infos):
+            check = QCheckBox();check.setEnabled(not info.get('error'));self.checks.append(check)
+            self.table.setCellWidget(row, 0, check)
+            group = next(g for g in self.groups if info in g['infos'])
+            texts = [os.path.basename(info['path']), str(info['shape'] or 'Unverified'), info.get('pixel') or 'Unknown',
+                     group['name'] + ' — ' + ('; '.join(group['issues']) or group['basis'])]
+            for col, text in enumerate(texts, 1):
+                item = QTableWidgetItem(text);item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setToolTip(info['path'] + '\n' + '; '.join(info['issues']));self.table.setItem(row, col, item)
+        layout.addWidget(self.table)
+        refrow = QHBoxLayout();refrow.addWidget(QLabel('Reference image:'))
+        self.reference_combo = QComboBox();refrow.addWidget(self.reference_combo, 1);layout.addLayout(refrow)
+        self.status = QLabel('');self.status.setWordWrap(True);layout.addWidget(self.status)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.apply_button = buttons.addButton('Use checked files', QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(self.apply_selection);buttons.rejected.connect(self.reject);layout.addWidget(buttons)
+        for check in self.checks:check.toggled.connect(self.update_selection)
+        self.group_combo.currentIndexChanged.connect(self.choose_group)
+        self.choose_group()
+
+    def choose_group(self, *_):
+        group = self.groups[self.group_combo.currentData()]
+        self.summary.setText(group['basis'] + '. ' + ('Review: ' + '; '.join(group['issues']) if group['issues'] else 'Dimensions and pixel sizes agree.'))
+        for check, info in zip(self.checks, self.infos):
+            check.blockSignals(True)
+            check.setChecked(check.isEnabled() and info in group['infos'])
+            check.blockSignals(False)
+        self.update_selection()
+        if len(group['references']) == 1:
+            index = self.reference_combo.findData(group['references'][0])
+            if index >= 0:self.reference_combo.setCurrentIndex(index)
+
+    def update_selection(self, *_):
+        old = self.reference_combo.currentData()
+        selected = [info for check, info in zip(self.checks, self.infos) if check.isEnabled() and check.isChecked()]
+        self.reference_combo.clear();self.reference_combo.addItem('None / choose manually later', '')
+        for info in selected:self.reference_combo.addItem(os.path.basename(info['path']), info['path'])
+        index = self.reference_combo.findData(old)
+        if index >= 0:self.reference_combo.setCurrentIndex(index)
+        self.apply_button.setEnabled(bool(selected))
+        shapes = {i['shape'] for i in selected if i['shape']}
+        pixels = [float(i['pixel']) for i in selected if i.get('pixel')]
+        conflict = len(shapes) > 1 or (pixels and any(not np.isclose(pixels[0], p, rtol=1e-6, atol=0) for p in pixels))
+        self.status.setText('Conflicting dimensions or pixel sizes: revise the checked files before applying.' if conflict else
+                            f'{len(selected)} file(s) checked. Review uncertain matches before applying.')
+        self.apply_button.setEnabled(bool(selected) and not conflict)
+
+    def apply_selection(self):
+        if not self.apply_button.isEnabled():return
+        selected = [info for check, info in zip(self.checks, self.infos) if check.isChecked() and check.isEnabled()]
+        try:
+            verify_suggestion_sources(selected)
+            self.page.apply_acquisition_selection(selected, self.reference_combo.currentData() or '')
+        except (OSError, ValueError) as error:
+            self.status.setText(str(error));return
+        self.accept()
+
+
+
+
 class UploadPage(QWizardPage):
+    def review_acquisition_groups(self):
+        self.refresh_group_pool()
+        if not self._available_files:return
+        checked_state = copy.deepcopy(self.state)
+        checked_state.source_fingerprints.update(self._available_fingerprints)
+        infos = run_in_worker(self, 'Inspecting acquisition files',
+                              lambda: inspect_import_files(self._available_files, checked_state))
+        AcquisitionGroupsDialog(self, infos).exec()
+
+    def refresh_group_pool(self):
+        if getattr(self, '_pool_state', None) is not self.state:
+            self._pool_state = self.state
+            self._available_files = []
+            self._available_fingerprints = {}
+        for path in self.state.selected_file_paths:
+            if path not in self._available_files:self._available_files.append(path)
+        self._available_fingerprints.update(copy.deepcopy(self.state.source_fingerprints))
+
+    def apply_acquisition_selection(self, infos, reference):
+        paths = [info['path'] for info in infos]
+        if not paths or any(path not in self._available_files for path in paths):
+            raise ValueError('Choose files from the available list.')
+        if reference and reference not in paths:raise ValueError('The reference must be one of the checked files.')
+        if paths != self.state.selected_file_paths:
+            self.state.selected_file_paths = paths
+            self.state.reset_all_dependent_settings()
+            self.state.source_fingerprints.update({source_key(info['path']):
+                copy.deepcopy(self._available_fingerprints.get(source_key(info['path'])) or
+                    dict(sha256=info['sha256'], size_bytes=info['size_bytes'], recorded_utc=source_time(),
+                         baseline_kind='Selected acquisition')) for info in infos})
+        self.state.acquisition_reference_path = reference
+        if reference in self.state.renamed_names_by_path:
+            name = self.state.renamed_names_by_path[reference]
+            self.state.line_profile_settings.base_output_name = name
+            self.state.area_analysis_settings.base_output_name = name
+        self.refresh_list()
+        self.status_label.setText(f'{len(paths)} files active. {len(self._available_files)} files available in Review acquisition groups. '
+                                   'Click Next to review names and settings.')
+        self.completeChanged.emit()
+
+
     def __init__(self):
         super().__init__()
         self.setTitle(step_title(1, "Files"))
@@ -5196,13 +8055,16 @@ class UploadPage(QWizardPage):
             "Use this page to add the CSV files that contain your exported SEM-EDS map data. Each CSV file should normally correspond to one elemental map or one reference image, such as Cl, Fe, O, or greyscale.\n\n"
             "Click 'Choose CSV files' to select one or more files from your computer. You can return to the button and add more files if needed. Duplicate file paths are ignored.\n\n"
             "The demo button creates built-in example CSV files so that you can test the workflow without your own SEM-EDS data. The demo is fixed, so it loads the same example maps each time. The demo CSV files include five metadata rows and a detected pixel size, matching the default preprocessing settings.\n\n"
-            "If you remove or clear files, Elementti resets later selections such as names, ratios, masking, display settings, and line-profile settings, because those settings depend on the selected input files.\n\n"
+            "If you remove or clear files, Elementti resets later selections such as names, ratios, masking, display settings, and line-profile and area-analysis settings, because those settings depend on the selected input files.\n\n"
             "## Open a saved project\n"
             "Every time you click Generate, Elementti saves a project file (Project.elementti.json) with the outputs. "
             "'Open project' reads it back with every setting of every step. Choose 'Its own map files' to make the same "
             "outputs again (if the files were moved, Elementti asks for the folder that contains them), or 'Other map files' "
             "to use the same settings with new maps, for example another sample measured the same way. Then click Next "
-            "through the steps: every setting is already filled in, and you can check or change it."
+            "through the steps: every setting is already filled in, and you can check or change it. "
+            "Original analyses verify the CSV contents using SHA-256 fingerprints. Changed files need an explicit review; "
+            "older projects without fingerprints are marked unverified. Review source files shows full fingerprints in cell tooltips. "
+            "Using settings with new maps starts a new dataset and records that choice."
         )
 
         row = QHBoxLayout()
@@ -5213,6 +8075,9 @@ class UploadPage(QWizardPage):
         self.open_project_button = QPushButton("Open project")
         self.open_project_button.setToolTip("Open a saved Elementti project with all its settings")
         self.open_project_button.clicked.connect(self.open_project)
+        self.review_sources_button = QPushButton("Review source files")
+        self.review_sources_button.setToolTip("Check which CSV contents are unchanged, changed, missing or not yet fingerprinted.")
+        self.review_sources_button.clicked.connect(self.review_source_files)
 
         self.choose_button.clicked.connect(self.choose_files)
         self.demo_sample_button.clicked.connect(self.load_demo_sample_data)
@@ -5225,9 +8090,17 @@ class UploadPage(QWizardPage):
         row.addWidget(self.clear_button)
         row.addSpacing(16)
         row.addWidget(self.open_project_button)
+        row.addWidget(self.review_sources_button)
         row.addStretch()
         layout.addLayout(row)
 
+        group_row = QHBoxLayout()
+        self.group_files_button = QPushButton("Review acquisition groups…")
+        self.group_files_button.clicked.connect(self.review_acquisition_groups)
+        group_row.addWidget(self.group_files_button)
+        group_hint = QLabel("Optional: review suggested map groups and choose their reference image.")
+        group_hint.setWordWrap(True);group_row.addWidget(group_hint, 1)
+        layout.addLayout(group_row)
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.SingleSelection)
         layout.addWidget(self.file_list)
@@ -5249,7 +8122,10 @@ class UploadPage(QWizardPage):
         return len(self.state.selected_file_paths) > 0
 
     def refresh_list(self):
+        self.refresh_group_pool()
+        self.group_files_button.setEnabled(bool(self._available_files))
         self.file_list.clear()
+        self.review_sources_button.setEnabled(bool(self.state.selected_file_paths))
         for path in self.state.selected_file_paths:
             item = QListWidgetItem(os.path.basename(path))
             item.setData(Qt.UserRole, path)
@@ -5266,6 +8142,14 @@ class UploadPage(QWizardPage):
             return
 
         added = 0
+        new_paths = [path for path in file_names if path not in self.state.selected_file_paths]
+        try:
+            fingerprints = run_in_worker(self, "Recording source-file fingerprints",
+                lambda: {source_key(path):dict(fingerprint_source_file(path), recorded_utc=source_time(),
+                    baseline_kind="Selected input") for path in new_paths})
+        except (OSError, ValueError) as exc:
+            ui.warn(self, "Files not added", str(exc))
+            return
         for path in file_names:
             if path not in self.state.selected_file_paths:
                 self.state.selected_file_paths.append(path)
@@ -5275,6 +8159,7 @@ class UploadPage(QWizardPage):
             self.state.sample_data_mode = ""
             self.state.sample_data_seed = None
             self.state.reset_all_dependent_settings()
+            self.state.source_fingerprints.update(fingerprints)
 
         self.refresh_list()
         self.status_label.setText(
@@ -5292,6 +8177,8 @@ class UploadPage(QWizardPage):
             # Use a fresh temporary folder for each demo load. This avoids
             # overwriting files that may still be referenced by previews or by
             # the operating system, which can be fragile on Windows.
+            self._pool_state = None
+            self.state.acquisition_reference_path = ""
             old_sample_folder = self.state.sample_data_folder
             sample_folder = tempfile.mkdtemp(prefix="elementti_demo_")
             sample_paths, used_seed = create_sample_data_files(sample_folder, seed=DEFAULT_SAMPLE_SEED)
@@ -5333,6 +8220,9 @@ class UploadPage(QWizardPage):
         if path in self.state.selected_file_paths:
             self.state.selected_file_paths.remove(path)
 
+        if path in self._available_files:self._available_files.remove(path)
+        self._available_fingerprints.pop(source_key(path), None)
+        if self.state.acquisition_reference_path == path:self.state.acquisition_reference_path = ""
         self.state.renamed_names_by_path.pop(path, None)
         self.state.file_processing_settings.pop(path, None)
         self.state.reset_all_dependent_settings()
@@ -5358,6 +8248,8 @@ class UploadPage(QWizardPage):
                   f"Remove all {count} file{'s' if count != 1 else ''} from the list? The settings of the later steps "
                   "are cleared too.", yes="Remove all files", no="Keep them"):
             old_sample_folder = self.state.sample_data_folder
+            self._pool_state = None
+            self.state.acquisition_reference_path = ""
             self.state.selected_file_paths.clear()
             self.state.renamed_names_by_path.clear()
             self.state.file_processing_settings.clear()
@@ -5372,75 +8264,73 @@ class UploadPage(QWizardPage):
 
 
     def open_project(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open an Elementti project", "", "Elementti projects (*.elementti.json);;JSON files (*.json)")
-        if not path:
-            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open an Elementti project", "",
+            "Elementti projects (*.elementti.json);;JSON files (*.json)")
+        if not path:return
         try:
             data = read_project_file(path)
-        except ValueError as e:
-            ui.warn(self, "Project not opened", e)
-            return
-
+        except ValueError as exc:
+            ui.warn(self, "Project not opened", exc);return
         demo_folder = ""
+        template = False
         if data.get("demo"):
             demo_folder = tempfile.mkdtemp(prefix="elementti_demo_")
-            paths, _seed = create_sample_data_files(demo_folder, seed=DEFAULT_SAMPLE_SEED)
+            paths, _ = create_sample_data_files(demo_folder, seed=DEFAULT_SAMPLE_SEED)
             if len(paths) != len(data["files"]):
                 cleanup_demo_sample_folder(demo_folder)
-                ui.warn(self, "Project not opened", "The demo files of this project do not match the demo of this version.")
-                return
-            how = "the demo data"
+                ui.warn(self, "Project not opened", "The demo files do not match this saved project.");return
         else:
-            names = ", ".join(str(e.get("name", "")) for e in data["files"])
-            n = len(data["files"])
-            choice = ui.choose(
-                self, "Open project",
-                f"This project has {n} map file{'s' if n != 1 else ''}: {names}.\n\n"
-                "Make the same outputs again from its own map files, or use its settings with other map files "
-                "(for example new maps of another sample)?",
-                ["Its own map files", "Other map files", "Cancel"])
-            if choice == 2:
-                return
-            if choice == 0:
-                missing = missing_project_files(data)
-                if not missing:
-                    paths = [entry["path"] for entry in data["files"]]
-                else:
-                    if not ui.ask(self, "Map files not found",
-                                  f"{len(missing)} of the {n} map files were not found where they were saved; they may "
-                                  "have been moved. Choose the folder that contains them.",
-                                  yes="Choose the folder", no="Cancel", default_yes=True):
-                        return
-                    folder = QFileDialog.getExistingDirectory(self, "Choose the folder with the map files",
-                                                              os.path.dirname(path))
-                    if not folder:
-                        return
-                    paths, still_missing = find_files_in_folder(data, folder)
-                    if still_missing:
-                        ui.warn(self, "Map files not found",
-                                "These files are not in that folder:\n\n" + "\n".join(still_missing))
-                        return
-                how = "its own map files"
-            else:
-                new_paths, _ = QFileDialog.getOpenFileNames(
-                    self, "Choose the map files to use with these settings", os.path.dirname(path),
-                    "CSV Files (*.csv);;All Files (*)")
-                if not new_paths:
-                    return
-                dialog = MatchFilesDialog(data, new_paths, self)
-                if dialog.exec() != QDialog.Accepted:
-                    return
+            choice = ui.choose(self, "Open project",
+                "Reopen the original analysis and verify its source files, or apply the settings to a new dataset?",
+                ["Reopen original analysis", "Use settings with new maps", "Cancel"])
+            if choice not in (0, 1):return
+            template = choice == 1
+            if template:
+                paths, _ = QFileDialog.getOpenFileNames(self, "Choose the new dataset", os.path.dirname(path),
+                    "CSV files (*.csv);;All files (*)")
+                if not paths:return
+                dialog = MatchFilesDialog(data, paths, self)
+                if dialog.exec() != QDialog.Accepted:return
                 paths = dialog.paths()
-                how = "the files you chose"
-
+            else:
+                paths = [entry.get("path", "") for entry in data["files"]]
+                missing = missing_project_files(data)
+                if missing:
+                    names = [entry.get("file_name", "") for entry in data["files"] if not os.path.isfile(entry.get("path", ""))]
+                    if not ui.ask(self, "Missing source files", "Missing:\n" + "\n".join(names)
+                            + "\n\nChoose the folder containing the original files.", yes="Locate folder", no="Cancel"):
+                        return
+                    folder = QFileDialog.getExistingDirectory(self, "Locate original map files", os.path.dirname(path))
+                    if not folder:return
+                    paths, missing_names = find_files_in_folder(data, folder)
+                    if missing_names:
+                        ui.warn(self, "Some file names differ", "Select and match the current files. Their contents will still be verified.")
+                        candidates, _ = QFileDialog.getOpenFileNames(self, "Locate and match original map files", folder,
+                            "CSV files (*.csv);;All files (*)")
+                        if not candidates:return
+                        dialog = MatchFilesDialog(data, candidates, self)
+                        if dialog.exec() != QDialog.Accepted:return
+                        paths = dialog.paths()
         try:
-            new_state = state_from_project(data, paths)
-        except (ValueError, KeyError, TypeError) as e:
-            if demo_folder:
-                cleanup_demo_sample_folder(demo_folder)
-            ui.warn(self, "Project not opened", f"The project file could not be used.\n\n{e}")
-            return
+            rows = run_in_worker(self, "Checking source-file contents", lambda: inspect_source_files(data["files"], paths))
+            if any(row["status"] in ("Missing", "Unreadable") for row in rows):
+                SourceReviewDialog(rows, self, opening=True).exec()
+                raise SourceVerificationError("Some source files are missing or unreadable.")
+            new_state = state_from_project(data, paths, use_as_template=template)
+            if template:
+                accept_reviewed_sources(new_state, rows, "Saved settings were intentionally applied to a new dataset.",
+                    template=True, project_name=os.path.basename(path))
+            elif any(row["status"] in ("Changed", "Unverified") for row in rows):
+                dialog = SourceReviewDialog(rows, self, opening=True)
+                if dialog.exec() != QDialog.Accepted:
+                    if demo_folder:cleanup_demo_sample_folder(demo_folder)
+                    return
+                accept_reviewed_sources(new_state, rows, dialog.reason(), project_name=os.path.basename(path))
+            else:
+                accept_reviewed_sources(new_state, rows, "Original file contents verified.", project_name=os.path.basename(path))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if demo_folder:cleanup_demo_sample_folder(demo_folder)
+            ui.warn(self, "Project not opened", str(exc));return
         if demo_folder:
             new_state.sample_data_folder = demo_folder
             new_state.sample_data_mode = "demo"
@@ -5450,10 +8340,32 @@ class UploadPage(QWizardPage):
         if old_folder and os.path.abspath(old_folder) != os.path.abspath(demo_folder or "."):
             cleanup_demo_sample_folder(old_folder)
         self.refresh_list()
-        self.status_label.setText(
-            f"Project opened with {how}: {os.path.basename(path)}. Every setting is filled in; click Next to go "
-            "through the steps and check them.")
+        if template:
+            message = "Settings applied to a new dataset. Its source fingerprints were recorded. Review the retained region positions on the new maps."
+        else:
+            message = (f"{len(rows)} original source files verified." if all(r["status"] == "Unchanged" for r in rows)
+                else "Current source files were explicitly accepted and recorded. The review is included in the project and reports.")
+        self.status_label.setText(message + " Click Next to review the analysis settings.")
         self.completeChanged.emit()
+
+    def review_source_files(self):
+        if not self.state.selected_file_paths:return
+        try:
+            rows = run_in_worker(self, "Checking source-file contents", lambda: inspect_source_files(source_entries(self.state)))
+            dialog = SourceReviewDialog(rows, self)
+            if dialog.exec() != QDialog.Accepted:return
+            if any(row["status"] in ("Missing", "Unreadable") for row in rows):
+                self.status_label.setText("Missing or unreadable source files remain. Locate them before continuing.")
+                return
+            if any(row["status"] in ("Changed", "Unverified") for row in rows):
+                updated = copy.deepcopy(self.state)
+                accept_reviewed_sources(updated, rows, dialog.reason())
+                self.wizard().set_state(updated)
+                self.status_label.setText("Source review recorded. Continue through the settings to reload the accepted files and review region positions.")
+            else:
+                self.status_label.setText("All source files match their accepted fingerprints.")
+        except (OSError, ValueError) as exc:
+            ui.warn(self, "Source files not accepted", str(exc))
 
 
 class RenamePage(QWizardPage):
@@ -5483,12 +8395,6 @@ class RenamePage(QWizardPage):
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        self.table.setStyleSheet("""
-            QTableWidget::item:selected {
-                background: white;
-                color: black;
-            }
-        """)
         self.table.cellClicked.connect(self.start_editing_name_cell)
         layout.addWidget(self.table)
 
@@ -5875,6 +8781,12 @@ class OutputsPage(QWizardPage):
 
 
 class ProcessingSettingsPage(QWizardPage):
+    def review_import_suggestions(self):
+        paths = [self.table.item(row, 0).data(Qt.UserRole) for row in range(self.table.rowCount())]
+        if not paths:return
+        infos = run_in_worker(self, "Inspecting import metadata and grid", lambda: inspect_import_files(paths, self.state))
+        ImportSuggestionsDialog(self, infos).exec()
+
     def __init__(self):
         super().__init__()
         self.setTitle(step_title(4, "Preprocessing and pixel size"))
@@ -5896,6 +8808,13 @@ class ProcessingSettingsPage(QWizardPage):
             how_keys=[("preprocessing", "How preprocessing works")],
         )
 
+        suggest_row = QHBoxLayout()
+        self.import_suggestions_button = QPushButton("Review import suggestions…")
+        self.import_suggestions_button.clicked.connect(self.review_import_suggestions)
+        suggest_row.addWidget(self.import_suggestions_button)
+        suggest_hint = QLabel("Optional: detect header rows, label/index columns, scale factors, and pixel sizes.")
+        suggest_hint.setWordWrap(True);suggest_row.addWidget(suggest_hint, 1)
+        layout.addLayout(suggest_row)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             [
@@ -6841,7 +9760,219 @@ class MaskingSettingsPage(QWizardPage):
         return True
 
 
+class GroupFormattingDialog(QDialog):
+    """One-time, opt-in appearance copying; the page remains independently editable."""
+
+    def __init__(self, page):
+        super().__init__(page)
+        self.page = page
+        self.setWindowTitle("Group formatting")
+        self.resize(560, 550)
+        layout = QVBoxLayout(self)
+        intro = QLabel("Copy appearance settings from one output to the outputs you check below.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Copy from:"))
+        self.source_combo = QComboBox()
+        for row in range(page.table.rowCount()):
+            self.source_combo.addItem(page.table.item(row, 0).text(), row)
+        self.source_combo.setCurrentIndex(max(0, page.current_preview_row()))
+        source_row.addWidget(self.source_combo, 1)
+        layout.addLayout(source_row)
+
+        layout.addWidget(QLabel("Settings to copy:"))
+        self.property_checks = {}
+        for key, label, _column, checked in page.GROUP_FORMAT_FIELDS:
+            check = QCheckBox(label)
+            check.setChecked(checked)
+            self.property_checks[key] = check
+            layout.addWidget(check)
+            check.toggled.connect(self.update_apply_button)
+        note = QLabel("Colormaps apply only to Continuous outputs. Manual-bin colors, labels, "
+                      "display limits, and data settings stay as entered for each output.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addWidget(QLabel("Apply to (choose one or more):"))
+        self.targets_list = QListWidget()
+        for row in range(page.table.rowCount()):
+            item = QListWidgetItem(page.table.item(row, 0).text())
+            item.setData(Qt.UserRole, row)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.targets_list.addItem(item)
+        layout.addWidget(self.targets_list, 1)
+        target_buttons = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all targets")
+        self.clear_button = QPushButton("Clear targets")
+        self.select_all_button.clicked.connect(lambda: self.set_targets_checked(True))
+        self.clear_button.clicked.connect(lambda: self.set_targets_checked(False))
+        target_buttons.addWidget(self.select_all_button)
+        target_buttons.addWidget(self.clear_button)
+        target_buttons.addStretch()
+        layout.addLayout(target_buttons)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.apply_button = buttons.addButton("Apply to selected outputs", QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(self.apply_formatting)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.targets_list.itemChanged.connect(self.update_apply_button)
+        self.source_combo.currentIndexChanged.connect(self.update_source)
+        self.update_source()
+
+    def selected_target_rows(self):
+        return [self.targets_list.item(i).data(Qt.UserRole)
+                for i in range(self.targets_list.count())
+                if self.targets_list.item(i).flags() & Qt.ItemIsEnabled
+                and self.targets_list.item(i).checkState() == Qt.Checked]
+
+    def selected_fields(self):
+        return [key for key, check in self.property_checks.items()
+                if check.isEnabled() and check.isChecked()]
+
+    def set_targets_checked(self, checked):
+        self.targets_list.blockSignals(True)
+        try:
+            for i in range(self.targets_list.count()):
+                item = self.targets_list.item(i)
+                item.setCheckState(Qt.Checked if checked and item.flags() & Qt.ItemIsEnabled else Qt.Unchecked)
+        finally:
+            self.targets_list.blockSignals(False)
+        self.update_apply_button()
+
+    def update_source(self, *_args):
+        source_row = self.source_combo.currentData()
+        self.targets_list.blockSignals(True)
+        try:
+            for i in range(self.targets_list.count()):
+                item = self.targets_list.item(i)
+                row = item.data(Qt.UserRole)
+                is_source = row == source_row
+                item.setText(self.page.table.item(row, 0).text() + (" (source)" if is_source else ""))
+                if is_source:
+                    item.setCheckState(Qt.Unchecked)
+                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                else:
+                    item.setFlags(item.flags() | Qt.ItemIsEnabled)
+        finally:
+            self.targets_list.blockSignals(False)
+        for key, label, column, _checked in self.page.GROUP_FORMAT_FIELDS:
+            widget = self.page.table.cellWidget(source_row, column)
+            value = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+            self.property_checks[key].setText(f"{label}: {value}")
+        cmap_check = self.property_checks["colormap"]
+        continuous = self.page.table.cellWidget(source_row, 1).currentText() == "Continuous"
+        cmap_check.setEnabled(continuous)
+        if not continuous:
+            cmap_check.setChecked(False)
+        self.update_apply_button()
+
+    def update_apply_button(self, *_args):
+        # Checkboxes are connected while constructing the dialog, before buttons exist.
+        if not hasattr(self, "apply_button"):
+            return
+        rows = self.selected_target_rows()
+        fields = self.selected_fields()
+        eligible = [row for row in rows if any(
+            key != "colormap" or self.page.table.cellWidget(row, 1).currentText() == "Continuous"
+            for key in fields)]
+        self.apply_button.setEnabled(bool(eligible))
+        if not rows:
+            self.status_label.setText("No target outputs selected. Nothing changes until you click Apply.")
+        elif not fields:
+            self.status_label.setText("Choose at least one setting to copy.")
+        else:
+            self.status_label.setText(f"{len(eligible)} of {len(rows)} selected outputs will receive the chosen settings.")
+
+    def apply_formatting(self):
+        try:
+            self.page.apply_group_formatting(self.source_combo.currentData(),
+                                            self.selected_target_rows(), self.selected_fields())
+        except ValueError as error:
+            self.status_label.setText(str(error))
+            return
+        self.accept()
+
+
+
 class DisplaySettingsPage(QWizardPage):
+    GROUP_FORMAT_FIELDS = (
+        ("tick_label_size", "Colorbar number size", 11, True),
+        ("text_label_size", "Colorbar text size", 12, True),
+        ("colorbar_side", "Colorbar side", 3, False),
+        ("colormap", "Colormap", 2, False),
+    )
+
+    def open_group_formatting(self):
+        if self.table.rowCount() < 2:
+            return
+        GroupFormattingDialog(self).exec()
+
+    def apply_group_formatting(self, source_row, target_rows, fields):
+        """Change only selected appearance widgets, preserving pending per-map edits."""
+        definitions = {key: (label, column) for key, label, column, _default in self.GROUP_FORMAT_FIELDS}
+        if not fields or any(key not in definitions for key in fields):
+            raise ValueError("Choose at least one available appearance setting.")
+        if not isinstance(source_row, int) or not 0 <= source_row < self.table.rowCount():
+            raise ValueError("Choose a source output.")
+        targets = list(dict.fromkeys(target_rows))
+        if not targets or any(not isinstance(row, int) or not 0 <= row < self.table.rowCount()
+                              or row == source_row for row in targets):
+            raise ValueError("Choose one or more target outputs other than the source.")
+
+        # Validate every selected value before touching any target widget.
+        values = {}
+        for key in fields:
+            label, column = definitions[key]
+            widget = self.table.cellWidget(source_row, column)
+            value = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+            if key in ("tick_label_size", "text_label_size"):
+                value = value.strip()
+                if not value.isascii() or not value.isdigit() or not LABEL_FONT_SIZE_MIN <= int(value) <= LABEL_FONT_SIZE_MAX:
+                    raise ValueError(f"{label} in the source output must be a whole number from "
+                                     f"{LABEL_FONT_SIZE_MIN} to {LABEL_FONT_SIZE_MAX}. Edit it in the table and try again.")
+                value = str(int(value))
+            if key == "colormap" and self.table.cellWidget(source_row, 1).currentText() != "Continuous":
+                raise ValueError("Choose a Continuous source output to copy its colormap.")
+            values[key] = value
+
+        updates = []
+        changed_rows = set()
+        for row in targets:
+            for key, value in values.items():
+                if key == "colormap" and self.table.cellWidget(row, 1).currentText() != "Continuous":
+                    continue
+                widget = self.table.cellWidget(row, definitions[key][1])
+                if isinstance(widget, QComboBox) and widget.findText(value) < 0:
+                    raise ValueError("The source appearance setting is not available for a selected output.")
+                updates.append((widget, value))
+                changed_rows.add(row)
+        if not updates:
+            raise ValueError("The selected setting does not apply to the checked outputs. "
+                             "Colormaps can only be copied to Continuous outputs.")
+
+        was_suppressed = self._preview_suppress
+        self._preview_suppress = True
+        try:
+            for widget, value in updates:
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentText(value)
+                else:
+                    widget.setText(value)
+        finally:
+            self._preview_suppress = was_suppressed
+        source_name = self.table.item(source_row, 0).text()
+        self.status_label.setText(f"Group formatting applied from {source_name} to {len(changed_rows)} output(s). "
+                                  "You can still edit every output individually.")
+        self.schedule_preview_update()
+
+
     def __init__(self):
         super().__init__()
         self.setTitle(step_title(6, "Display settings"))
@@ -6860,6 +9991,7 @@ class DisplaySettingsPage(QWizardPage):
             "Manual-bin mode groups values into user-defined intervals. Enter boundary values separated by commas, for example 0, 0.5, 1, 1.5, 2. If you use decimal commas, separate bin boundaries with semicolons, for example 0; 0,5; 1,0. You must provide one fewer color than the number of boundaries, because each interval needs one color.\n\n"
             "Colors can be common color names such as white, black, gray, red, orange, yellow, green, cyan, blue, purple, magenta, or brown. Hex colors are also accepted, for example #FFFFFF, #000000, #FF0000, #00FF00, #0000FF, and #FFA500.\n\n"
             "Colorbar labels and colorbar side can be adjusted for each output. These settings are saved in the project file and described in Detailed explanations.docx, so the figure preparation is traceable.\n\n"
+            "Individual row editing is the default. The optional Group formatting button copies only the appearance settings you choose from one output to checked targets. Nothing is applied until you click Apply, and each row remains independently editable afterward. Colormap copying applies only to Continuous outputs; manual bins keep their own colors.\n\n"
             "The Tick size column sets the font size of the colorbar numbers for each output separately. It shows the size as a whole number (the normal size is 10); type any whole number from 8 to 20 to make the numbers smaller or larger. Each output can use its own tick size.\n\n"
             "The Text size column works the same way but sets the font size of the colorbar text label (the descriptive guide-bar label) for each output. It shows the size as a whole number (normally 10); type any whole number from 8 to 20.\n\n"
             "This page also lets you choose whether Elementti should export additional figures with physical scale bars. Pixel sizes are entered per input file in Step 4 and stored internally as µm/pixel. Step 4 can auto-convert clear metadata or typed entries using nm, µm/um, mm, cm, or m per pixel. If a scale-bar length is left blank, Elementti automatically chooses a clean rounded length close to one fifth to one fourth of each map width, using readable labels such as 500 nm, 20 µm, or 1 mm. If you enter a manual length, it must be large enough to be visible and not too large for the image.",
@@ -6896,6 +10028,17 @@ class DisplaySettingsPage(QWizardPage):
         scale_row_1.addWidget(how_button(self, "scale_bar", "How the scale bar works"))
         scale_row_1.addStretch()
         layout.addLayout(scale_row_1)
+
+        group_row = QHBoxLayout()
+        self.group_format_button = QPushButton("Group formatting…")
+        self.group_format_button.setToolTip("Optionally copy selected appearance settings to checked outputs.")
+        self.group_format_button.setEnabled(False)
+        self.group_format_button.clicked.connect(self.open_group_formatting)
+        group_row.addWidget(self.group_format_button)
+        group_hint = QLabel("Optional: copy appearance settings to several outputs. Each row stays editable.")
+        group_hint.setWordWrap(True)
+        group_row.addWidget(group_hint, 1)
+        layout.addLayout(group_row)
 
         self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
@@ -6942,6 +10085,13 @@ class DisplaySettingsPage(QWizardPage):
         self.preview_canvas.setMinimumHeight(340)
         self.preview_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.preview_canvas, stretch=1)
+        self._display_export=None
+        export_row=QHBoxLayout()
+        self.display_image_button=QPushButton("Save this map…");self.display_image_button.clicked.connect(self.export_display_image)
+        self.display_csv_button=QPushButton("Map CSV…");self.display_csv_button.clicked.connect(self.export_display_csv)
+        export_row.addWidget(self.display_image_button);export_row.addWidget(self.display_csv_button)
+        self.quick_export_status=QLabel("");export_row.addWidget(self.quick_export_status);export_row.addStretch()
+        layout.addLayout(export_row)
 
         self.status_label = QLabel("Choose the display settings you want, then click Next.")
         self.status_label.setWordWrap(True)
@@ -6986,6 +10136,27 @@ class DisplaySettingsPage(QWizardPage):
             self.preview_figure.clear()
             self.preview_canvas.draw_idle()
             self.status_label.setText("There was a problem reading one of the files. Please go back and check earlier steps.")
+
+    def export_display_csv(self):
+        self.draw_selected_output_preview()
+        snapshot=self._display_export
+        if snapshot is None:return
+        array,name,settings,masks,px=snapshot
+        run_quick_export(self,name,"csv",lambda path:self.wizard().engine.save_display_csv(array,name,path,masks,px))
+
+
+    def export_display_image(self):
+        self.draw_selected_output_preview()
+        snapshot=self._display_export
+        if snapshot is None:return
+        array,name,settings,masks,px=snapshot
+        scale=copy.deepcopy(self.current_scale_bar_preview_settings())
+        def write(path):
+            old=self.state.scale_bar_settings;self.state.scale_bar_settings=scale
+            try:self.wizard().engine.save_map_figure(array,name,settings,path,dpi=self.state.figure_dpi,
+                mask_layers=masks,add_scale_bar=scale.enabled and px is not None,pixel_size_um=px)
+            finally:self.state.scale_bar_settings=old
+        run_quick_export(self,name,"png",write)
 
     def get_output_names(self) -> List[str]:
         return self.state.get_output_names()
@@ -7128,6 +10299,8 @@ class DisplaySettingsPage(QWizardPage):
 
             self.on_mode_changed(row)
 
+        self.group_format_button.setEnabled(self.table.rowCount() > 1)
+
     def on_mode_changed(self, row):
         mode_combo = self.table.cellWidget(row, 1)
         cmap_combo = self.table.cellWidget(row, 2)
@@ -7188,6 +10361,8 @@ class DisplaySettingsPage(QWizardPage):
         )
 
     def draw_selected_output_preview(self):
+        self._display_export=None
+        self.display_csv_button.setEnabled(False);self.display_image_button.setEnabled(False)
         self.preview_figure.clear()
         ax = self.preview_figure.add_subplot(111)
         row = self.current_preview_row()
@@ -7248,6 +10423,8 @@ class DisplaySettingsPage(QWizardPage):
                 add_scale_bar=self.state.scale_bar_settings.enabled and (pixel_size_um is not None),
                 pixel_size_um=pixel_size_um,
             )
+            self._display_export=(array,output_name,copy.deepcopy(settings),mask_layers,pixel_size_um)
+            self.display_csv_button.setEnabled(True);self.display_image_button.setEnabled(True)
         except Exception as e:
             self.preview_figure.clear()
             ax = self.preview_figure.add_subplot(111)
@@ -7532,7 +10709,7 @@ class LineProfileIntroPage(QWizardPage):
     def nextId(self):
         if self.enable_combo.currentText() == "Yes":
             return ElementtiWizard.PAGE_LINE_PROFILE
-        return ElementtiWizard.PAGE_GENERATE
+        return ElementtiWizard.PAGE_AREA_ANALYSIS_INTRO
 
 
 class LineProfilePage(QWizardPage):
@@ -7545,6 +10722,7 @@ class LineProfilePage(QWizardPage):
         self.output_arrays_cache: Dict[str, np.ndarray] = {}
         self.preview_point: Optional[Tuple[float, float]] = None
         self._updating_controls = False
+        self._last_profile_data=None
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
@@ -7585,14 +10763,23 @@ class LineProfilePage(QWizardPage):
         # left = map with the selected transect, right = line-profile plot.
         self.combined_figure = Figure(figsize=(8.4, 3.4), dpi=100)
         self.combined_canvas = FigureCanvas(self.combined_figure)
-        self.combined_canvas.setFixedSize(840, 340)
-        self.combined_canvas.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.combined_canvas.setMinimumSize(480, 270)
+        self.combined_canvas.setMaximumHeight(340)
+        self.combined_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.map_ax = self.combined_figure.add_subplot(121)
         self.profile_ax = self.combined_figure.add_subplot(122)
 
         self.combined_canvas.mpl_connect("button_press_event", self.on_map_click)
         self.combined_canvas.mpl_connect("motion_notify_event", self.on_map_motion)
         layout.addWidget(self.combined_canvas, alignment=Qt.AlignCenter)
+        export_row=QHBoxLayout()
+        self.profile_map_button=QPushButton("Save map…");self.profile_map_button.clicked.connect(self.export_profile_map)
+        self.line_csv_button=QPushButton("Line coordinates CSV…");self.line_csv_button.clicked.connect(self.export_line_coordinates)
+        self.profile_image_button=QPushButton("Save chart…");self.profile_image_button.clicked.connect(self.export_profile_image)
+        self.profile_csv_button=QPushButton("Profile CSV…");self.profile_csv_button.clicked.connect(self.export_profile_csv)
+        export_row.addWidget(self.profile_map_button);export_row.addWidget(self.line_csv_button);export_row.addStretch(3)
+        export_row.addWidget(self.profile_image_button);export_row.addWidget(self.profile_csv_button);export_row.addStretch(1)
+        layout.addLayout(export_row)
 
         coord_row = QHBoxLayout()
         coord_row.setSpacing(6)
@@ -7776,6 +10963,45 @@ class LineProfilePage(QWizardPage):
         layout.addWidget(self.status_label)
 
         set_page_layout(self, layout)
+
+    def export_profile_csv(self):
+        if self._last_profile_data is None:return
+        snapshot=copy.deepcopy(self._last_profile_data)
+        run_quick_export(self,"line_profile","csv",lambda path:self.wizard().engine.save_line_profile_csv(snapshot,path))
+
+
+    def export_profile_image(self):
+        if self._last_profile_data is None:return
+        snapshot=copy.deepcopy(self._last_profile_data)
+        run_quick_export(self,"line_profile","png",lambda path:self.wizard().engine.save_line_profile_figure(snapshot,path,dpi=self.state.figure_dpi))
+
+
+    def export_line_coordinates(self):
+        if self._last_profile_data is None:return
+        snapshot=copy.deepcopy(self._last_profile_data)
+        def write(path):
+            with open(path,"w",newline="",encoding="utf-8-sig") as f:
+                writer=csv.writer(f)
+                writer.writerow(["background","start_x_pixels","start_y_pixels","end_x_pixels","end_y_pixels","pixel_size_um"])
+                writer.writerow([area_csv_cell(snapshot["base_output_name"]),snapshot["start_x"],snapshot["start_y"],snapshot["end_x"],snapshot["end_y"],snapshot["pixel_size_um_per_pixel"]])
+        run_quick_export(self,"line_coordinates","csv",write)
+
+
+    def export_profile_map(self):
+        if self._last_profile_data is None:return
+        data=copy.deepcopy(self._last_profile_data)
+        name=data["base_output_name"];array=self.output_arrays_cache[name]
+        settings=self.get_display_settings_for_base(name)
+        masks=self.wizard().engine.build_grayscale_mask_layers(self.raw_arrays_cache,output_name=name)
+        coords=(data["start_x"],data["start_y"],data["end_x"],data["end_y"])
+        def write(path):
+            fig,ax=plt.subplots(figsize=(7,5.5))
+            try:
+                self.wizard().engine.plot_output_map_axis(ax,array,name,settings,mask_layers=masks,line_coords=coords,
+                    pixel_size_um=data["pixel_size_um_per_pixel"],show_line_length_label=True)
+                fig.tight_layout();fig.savefig(path,bbox_inches="tight",dpi=self.state.figure_dpi)
+            finally:plt.close(fig)
+        run_quick_export(self,name+"_line","png",write)
 
     def make_help_button(self, title: str, text: str) -> QPushButton:
         button = QPushButton("Read instructions")
@@ -8230,6 +11456,8 @@ class LineProfilePage(QWizardPage):
         return None
 
     def draw_combined_preview(self):
+        self._last_profile_data=None
+        for button in (self.profile_map_button,self.line_csv_button,self.profile_image_button,self.profile_csv_button):button.setEnabled(False)
         self.combined_figure.clear()
 
         if self.enable_combo.currentText() != "Yes":
@@ -8328,6 +11556,8 @@ class LineProfilePage(QWizardPage):
                     lp.end_y,
                     lp.normalize_mode,
                 )
+                self._last_profile_data=profile_data
+                for button in (self.profile_map_button,self.line_csv_button,self.profile_image_button,self.profile_csv_button):button.setEnabled(True)
                 self.wizard().engine.plot_line_profile_axis(
                     self.profile_ax,
                     profile_data,
@@ -8470,10 +11700,2118 @@ class LineProfilePage(QWizardPage):
         return True
 
 
+class AreaAnalysisIntroPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+        self.setTitle(step_title(8, "Area analysis"))
+        self.setSubTitle("Choose whether to compare the composition of regions drawn on a map.")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(32, 28, 32, 28)
+        layout.setSpacing(12)
+
+        card = QFrame()
+        card.setObjectName("optionalDecisionCard")
+        card.setMinimumWidth(760)
+        card.setMaximumWidth(1100)
+        card.setMinimumHeight(220)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        card.setStyleSheet(
+            "QFrame#optionalDecisionCard { background: white; border: 1px solid #d6d6d6; border-radius: 8px; }"
+        )
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 18, 22, 18)
+        card_layout.setSpacing(14)
+
+        title_label = QLabel("Optional area analysis / region composition")
+        title_label.setStyleSheet("font-weight: 700; font-size: 15px;")
+        card_layout.addWidget(title_label)
+
+        summary_label = QLabel(
+            "Choose Yes if you want to draw one or more regions on a map or reference image (rectangle, square, ellipse, "
+            "polygon or freehand) and get the mean value of the selected maps, ratios and formulas inside each region, "
+            "for example the steel, the corrosion product layer and the deposit. Elementti saves a table of the region "
+            "values and a two-panel figure: the map with the regions on the left, and a chart comparing the regions on the right. "
+            "Choose No if you do not need region values."
+        )
+        summary_label.setWordWrap(True)
+        summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card_layout.addWidget(summary_label)
+
+        choice_row = QHBoxLayout()
+        choice_row.setSpacing(10)
+        choice_row.addWidget(QLabel("Create area analysis:"))
+        self.enable_combo = QComboBox()
+        self.enable_combo.addItems(["No", "Yes"])
+        self.enable_combo.setMinimumWidth(110)
+        choice_row.addWidget(self.enable_combo)
+        choice_row.addStretch()
+        card_layout.addLayout(choice_row)
+
+        layout.addWidget(card, 0, Qt.AlignTop)
+        layout.addStretch()
+
+        set_page_layout(self, layout, scrollable=False)
+
+    @property
+    def state(self) -> AppState:
+        return self.wizard().state
+
+    def initializePage(self):
+        self.enable_combo.setCurrentText("Yes" if self.state.area_analysis_settings.enabled else "No")
+
+    def validatePage(self):
+        self.state.area_analysis_settings.enabled = (self.enable_combo.currentText() == "Yes")
+        return True
+
+    def nextId(self):
+        if self.enable_combo.currentText() == "Yes":
+            return ElementtiWizard.PAGE_AREA_ANALYSIS
+        return ElementtiWizard.PAGE_GENERATE
+
+
+class AreaAnalysisPage(QWizardPage):
+    COL_NAME, COL_SHAPE, COL_COLOR, COL_PIXELS, COL_AREA, COL_POINTS = range(6)
+    CLOSE_DISTANCE_PX = 9.0          # a click this near the first corner closes a polygon (screen pixels)
+    CLICK_DISTANCE_PX = 4.0          # a press and release this near each other is a click, not a drag
+
+    def __init__(self):
+        super().__init__()
+        self.setTitle(step_title(8, "Area-analysis settings"))
+        self.setSubTitle("Draw regions on the map and compare their mean values.")
+
+        self.raw_arrays_cache: Dict[str, np.ndarray] = {}
+        self.output_arrays_cache: Dict[str, np.ndarray] = {}
+        self._updating_controls = False
+        self._drawing: Optional[dict] = None
+        self._preview_artists: List[object] = []
+        self._last_result: Optional[dict] = None
+        self._result_message = ""
+        self._undo_history = []
+        self._edit_drag = None
+        self._map_view = None
+        self._has_area_view = False
+        self._view_key = None
+        self._grid_message = ""
+        self._common_preference=True
+        self._interaction_ax=None
+        self._detail_drag=None
+        self._detail_result=None
+        self._detail_window_artists=[]
+        self._detail_limits_guard=False
+        self._mode_switching=False
+        self._hover_region_id=None
+        self._hover_artists=[]
+        self.detail_map_ax=None
+        self.detail_chart_ax=None
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        top_row.addWidget(QLabel("Background:"))
+        self.base_output_combo = QComboBox()
+        self.base_output_combo.currentTextChanged.connect(self.on_base_output_changed)
+        top_row.addWidget(self.base_output_combo, stretch=1)
+
+        self.draw_button = QPushButton("Draw")
+        self.draw_button.setCheckable(True)
+        self.draw_button.setChecked(True)
+        self.draw_button.setToolTip("Return to drawing the selected shape. Turns off Zoom, Pan, Edit regions and detail-box placement.")
+        self.draw_button.clicked.connect(self.activate_drawing)
+        top_row.addWidget(self.draw_button)
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItems(AREA_SHAPES)
+        self.shape_combo.setCurrentText("Freehand")
+        self.shape_combo.setToolTip(
+            "Rectangle, Square, Ellipse, Circle: drag on the map, or click two opposite corners.\n"
+            "Polygon: click every corner; double-click, right-click or click the first corner to close it.\n"
+            "Freehand: hold the mouse button and draw around the region."
+        )
+        self.shape_combo.currentTextChanged.connect(self.on_shape_changed)
+        top_row.addWidget(self.shape_combo)
+
+        self.finish_button = QPushButton("Close polygon")
+        self.finish_button.setToolTip("Close the polygon that is being drawn (it needs at least three corners)")
+        self.finish_button.clicked.connect(self.finish_polygon)
+        top_row.addWidget(self.finish_button)
+
+        self.cancel_button = QPushButton("Cancel shape")
+        self.cancel_button.setToolTip("Throw away the shape that is being drawn")
+        self.cancel_button.clicked.connect(self.cancel_drawing)
+        top_row.addWidget(self.cancel_button)
+
+        top_row.addWidget(how_button(self, "area_analysis"))
+        top_row.addWidget(self.make_help_button(
+            "Area analysis help",
+            "Use this optional page to get the mean value of one or more maps, ratio maps or formula maps inside regions that you draw, "
+            "and to compare the regions with each other, for example the steel, the corrosion product layer and the deposit.\n\n"
+            "Choose the background shown on the left. It only helps you to place the regions; the outputs that are analysed are chosen in the Outputs tab. "
+            "A greyscale image is often the easiest background for finding the layers.\n\n"
+            "Click Draw to activate drawing, then choose a shape and draw it on the map. The blue mode label shows whether dragging draws, edits, pans or zooms.  Rectangle, Square, Ellipse and Circle: press the mouse button on one corner, drag to the opposite corner and release; "
+            "or click one corner, move the mouse and click the opposite corner. Polygon: click every corner in turn; double-click, right-click, click the first corner again, "
+            "or use 'Close polygon' to finish. Freehand: hold the mouse button and draw around the region; the outline is closed when you release the button. "
+            "'Cancel shape' throws away a shape that is not finished. You can draw as many regions as you need, and mix the shapes.\n\n"
+            "Every finished region appears in the Regions tab. Click a row to highlight the region on the map. Double-click the name to give it a meaningful name such as Steel or Deposit; "
+            "the color and the outline points can be edited in the same way. Outline points are in pixels, written as 'x y; x y': two opposite corners for a rectangle, square or ellipse, "
+            "and every corner for a polygon. Enable Edit regions to move an outline or drag its white handles. Undo restores the last region change. The mouse wheel zooms; the toolbar pans and zooms.\n\n"
+            "In the Outputs tab, choose which outputs are analysed. 'Leave out masked pixels' leaves out the pixels hidden by greyscale masking in step 5 (pores, resin, background), "
+            "so they do not pull the mean. 'Normalise the means of the element maps to 100' rescales the means of the selected element maps so that they add up to 100, "
+            "which reports relative proportions of the selected quantified elements. It does not recover missing elements or their original atomic/weight percentages.\n\n"
+            "The Results tab shows the mean ± standard deviation of every output in every region, and 'Copy results' copies the table so that it can be pasted into a spreadsheet. "
+            "Hold the mouse over a cell to see the number of pixels, the median, the minimum and the maximum.\n\n"
+            "In the Style tab, edit titles, axis labels, error bars, the legend and region labels. Units are shown once on each axis when they are shared.\n\n"
+            "Enable Detail view to keep the overview above an enlarged map and its own chart. Set / move detail box lets you draw, move or resize the dashed overview box. "
+            "The wheel on either map adjusts the detail while it is open. Reset detail restores the full field; Close detail hides the lower view. "
+            "Draw or edit regions in either map; all coordinates refer to the original image. Visible regions includes intersecting regions with their complete statistics. "
+            "Use the Detail checkboxes in Regions for an explicit selection. Analyse this zoom area creates a new named region. Zooming alone never changes region compositions. "
+            "The lower map and chart have their own image and CSV exports. Save Excel report, below each comparison chart, "
+            "creates a workbook with Region comparison, Detailed statistics and Analysis settings. The Figures sheet embeds the corresponding annotated map and comparison chart. The detail workbook contains "
+            "only the regions in the detail chart, with complete-region statistics. Excel reports are snapshots of the selected analysis."
+        ))
+        layout.addLayout(top_row)
+
+        # The live view shows what the exported two-panel figure holds: left = map with the regions,
+        # right = chart of the region values. Here the map is the larger panel, to draw on it.
+        self.combined_figure = Figure(figsize=(8.4, 3.8), dpi=100)
+        self.combined_canvas = FigureCanvas(self.combined_figure)
+        self.combined_canvas.setMinimumSize(480, 230)
+        self.combined_canvas.setMaximumHeight(330)
+        self.combined_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.combined_canvas.setCursor(Qt.CrossCursor)
+        self.map_ax = self.combined_figure.add_subplot(121)
+        self.chart_ax = self.combined_figure.add_subplot(122)
+        self.combined_canvas.mpl_connect("button_press_event", self.on_mouse_press)
+        self.combined_canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.combined_canvas.mpl_connect("button_release_event", self.on_mouse_release)
+        self.combined_canvas.mpl_connect("scroll_event", self.on_area_scroll)
+        self.combined_canvas.mpl_connect("resize_event", self.on_area_resize)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self.resize_area_preview)
+        tool_row = QHBoxLayout()
+        self.navigation = InteractionToolbar(self.combined_canvas, self)
+        self.navigation.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        tool_row.addWidget(self.navigation)
+        self.edit_checkbox = QCheckBox("Edit regions")
+        self.edit_checkbox.setToolTip("Move or reshape existing regions. Click Draw when you want to add another region.")
+        self.edit_checkbox.toggled.connect(self.on_edit_toggled)
+        tool_row.addWidget(self.edit_checkbox)
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.setEnabled(False)
+        self.undo_button.clicked.connect(self.undo_area_edit)
+        tool_row.addWidget(self.undo_button)
+        fit_button = QPushButton("Fit map")
+        fit_button.clicked.connect(self.fit_area_view)
+        tool_row.addWidget(fit_button)
+        self.grid_button = QPushButton("Use current grid")
+        self.grid_button.setToolTip("Explicitly assign the existing outline coordinates to this grid after reviewing their positions. Undo restores the previous assignment.")
+        self.grid_button.clicked.connect(self.adopt_area_grid)
+        tool_row.addWidget(self.grid_button)
+        tool_row.addStretch()
+        layout.addLayout(tool_row)
+        self.mode_label = QLabel("Mode: Draw Freehand — overview.")
+        self.mode_label.setObjectName("interactionMode")
+        self.mode_label.setWordWrap(True)
+        self.mode_label.setToolTip("Shows what dragging on the map will do. Click Draw to return from Zoom or Pan.")
+        layout.addWidget(self.mode_label)
+        layout.addWidget(self.combined_canvas, stretch=1)
+        export_row=QHBoxLayout()
+        self.map_image_button=QPushButton("Save map…")
+        self.map_image_button.clicked.connect(self.export_area_map_image)
+        self.map_csv_button=QPushButton("Regions CSV…")
+        self.map_csv_button.clicked.connect(self.export_area_regions_csv)
+        export_row.addWidget(self.map_image_button);export_row.addWidget(self.map_csv_button)
+        export_row.addStretch(3)
+        self.chart_image_button=QPushButton("Save chart…")
+        self.chart_image_button.clicked.connect(self.export_area_chart_image)
+        self.chart_csv_button=QPushButton("Chart CSV…")
+        self.chart_csv_button.clicked.connect(self.export_area_chart_csv)
+        export_row.addWidget(self.chart_image_button);export_row.addWidget(self.chart_csv_button)
+        self.chart_excel_button=QPushButton("Save Excel report…")
+        self.chart_excel_button.setToolTip("Save the displayed comparison, detailed statistics and analysis settings in one Excel workbook.")
+        self.chart_excel_button.clicked.connect(self.export_area_chart_excel)
+        export_row.addWidget(self.chart_excel_button)
+        choose_elements=QPushButton("Elements…")
+        choose_elements.clicked.connect(self.choose_chart_elements)
+        export_row.addWidget(choose_elements);export_row.addStretch(1)
+        layout.addLayout(export_row)
+
+        # Linked overview/detail view, with separate data/image export controls.
+        detail_controls=QHBoxLayout()
+        self.detail_view_checkbox=QCheckBox("Detail view")
+        self.detail_view_checkbox.toggled.connect(self.on_detail_toggled)
+        detail_controls.addWidget(self.detail_view_checkbox)
+        self.detail_box_button=QPushButton("Set / move detail box")
+        self.detail_box_button.setCheckable(True)
+        self.detail_box_button.setToolTip("Drag on the overview to position the enlarged view. Click Draw to draw regions again.")
+        self.detail_box_button.toggled.connect(self.on_detail_box_mode)
+        detail_controls.addWidget(self.detail_box_button)
+        self.detail_reset_button=QPushButton("Reset detail")
+        self.detail_reset_button.clicked.connect(self.reset_detail_view)
+        detail_controls.addWidget(self.detail_reset_button)
+        self.detail_close_button=QPushButton("Close detail")
+        self.detail_close_button.clicked.connect(lambda:self.detail_view_checkbox.setChecked(False))
+        detail_controls.addWidget(self.detail_close_button);detail_controls.addStretch()
+        layout.addLayout(detail_controls)
+        self.detail_panel=QWidget()
+        detail_layout=QVBoxLayout(self.detail_panel)
+        detail_layout.setContentsMargins(0,0,0,0)
+        detail_layout.setSpacing(5)
+        detail_options=QHBoxLayout()
+        detail_options.addWidget(QLabel("Detail chart:"))
+        self.detail_region_combo=QComboBox()
+        self.detail_region_combo.addItems(["Visible regions","Checked regions"])
+        self.detail_region_combo.currentTextChanged.connect(self.on_detail_region_mode)
+        detail_options.addWidget(self.detail_region_combo)
+        self.detail_analyse_button=QPushButton("Analyse this zoom area")
+        self.detail_analyse_button.clicked.connect(self.analyse_detail_area)
+        detail_options.addWidget(self.detail_analyse_button);detail_options.addStretch()
+        detail_layout.addLayout(detail_options)
+        self.detail_figure=Figure(figsize=(8.4,3.3),dpi=100)
+        self.detail_canvas=FigureCanvas(self.detail_figure)
+        self.detail_canvas.setMinimumSize(480,270)
+        self.detail_canvas.setMaximumHeight(360)
+        self.detail_canvas.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
+        self.detail_navigation=InteractionToolbar(self.detail_canvas,self)
+        self.navigation.modeChanged.connect(lambda: self.on_area_navigation_changed(self.navigation))
+        self.detail_navigation.modeChanged.connect(lambda: self.on_area_navigation_changed(self.detail_navigation))
+        self.combined_canvas.mpl_connect("figure_leave_event", self.clear_region_hover)
+        self.detail_canvas.mpl_connect("figure_leave_event", self.clear_region_hover)
+        detail_layout.addWidget(self.detail_navigation)
+        detail_layout.addWidget(self.detail_canvas)
+        self.detail_canvas.mpl_connect("button_press_event",self.on_mouse_press)
+        self.detail_canvas.mpl_connect("motion_notify_event",self.on_mouse_move)
+        self.detail_canvas.mpl_connect("button_release_event",self.on_mouse_release)
+        self.detail_canvas.mpl_connect("button_release_event",self.on_detail_navigation_release)
+        self.detail_canvas.mpl_connect("scroll_event",self.on_area_scroll)
+        self._detail_timer=QTimer(self);self._detail_timer.setSingleShot(True)
+        self._detail_timer.timeout.connect(self.draw_detail_panel)
+        self._detail_nav_timer=QTimer(self);self._detail_nav_timer.setSingleShot(True)
+        self._detail_nav_timer.timeout.connect(self.sync_detail_navigation)
+        exports=QHBoxLayout()
+        self.detail_map_image_button=QPushButton("Save detail map…")
+        self.detail_map_image_button.clicked.connect(self.export_detail_map_image)
+        self.detail_regions_csv_button=QPushButton("Detail regions CSV…")
+        self.detail_regions_csv_button.clicked.connect(self.export_detail_regions_csv)
+        exports.addWidget(self.detail_map_image_button);exports.addWidget(self.detail_regions_csv_button);exports.addStretch(3)
+        self.detail_chart_image_button=QPushButton("Save detail chart…")
+        self.detail_chart_image_button.clicked.connect(self.export_detail_chart_image)
+        self.detail_csv_button=QPushButton("Detail chart CSV…")
+        self.detail_csv_button.clicked.connect(self.export_detail_chart_csv)
+        exports.addWidget(self.detail_chart_image_button);exports.addWidget(self.detail_csv_button)
+        self.detail_excel_button=QPushButton("Save detail Excel report…")
+        self.detail_excel_button.setToolTip("Export only the regions and outputs in this detail chart, retaining complete-region statistics.")
+        self.detail_excel_button.clicked.connect(self.export_detail_chart_excel)
+        exports.addWidget(self.detail_excel_button);exports.addStretch(1)
+        detail_layout.addLayout(exports)
+        self.detail_status=QLabel("Whole-region values. Zooming changes the view, not composition.")
+        self.detail_status.setWordWrap(True);detail_layout.addWidget(self.detail_status)
+        self.detail_panel.hide()
+        layout.addWidget(self.detail_panel)
+
+        self.tabs = QTabWidget()
+
+        # --- Regions tab ---
+        regions_tab = QWidget()
+        regions_layout = QVBoxLayout(regions_tab)
+        regions_layout.setContentsMargins(6, 6, 6, 6)
+        regions_layout.setSpacing(5)
+
+        region_buttons_row = QHBoxLayout()
+        region_hint = QLabel("Click a row to highlight a region. Double-click a name, color or outline to edit it.")
+        region_buttons_row.addWidget(region_hint, stretch=1)
+        self.delete_region_button = QPushButton("Delete selected region")
+        self.delete_region_button.clicked.connect(self.delete_selected_region)
+        region_buttons_row.addWidget(self.delete_region_button)
+        self.clear_regions_button = QPushButton("Clear all regions")
+        self.clear_regions_button.clicked.connect(self.clear_regions)
+        region_buttons_row.addWidget(self.clear_regions_button)
+        regions_layout.addLayout(region_buttons_row)
+
+        self.region_table = QTableWidget(0, 7)
+        self.region_table.setHorizontalHeaderLabels(
+            ["Name", "Shape", "Outline color", "Pixels", "Area", "Outline points in pixels (x y; x y; ...)", "Detail"]
+        )
+        header = self.region_table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_NAME, QHeaderView.Interactive)
+        header.setSectionResizeMode(self.COL_SHAPE, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_COLOR, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_PIXELS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_AREA, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_POINTS, QHeaderView.Stretch)
+        header.setSectionResizeMode(6,QHeaderView.ResizeToContents)
+        self.region_table.setColumnWidth(self.COL_NAME, 190)
+        self.region_table.verticalHeader().setVisible(False)
+        self.region_table.setAlternatingRowColors(True)
+        self.region_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.region_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.region_table.verticalHeader().setDefaultSectionSize(26)
+        self.region_table.setMinimumHeight(130)
+        self.region_table.itemChanged.connect(self.on_region_item_changed)
+        self.region_table.itemSelectionChanged.connect(self.on_region_selection_changed)
+        regions_layout.addWidget(self.region_table)
+        self.tabs.addTab(regions_tab, "Regions")
+
+        # --- Outputs tab ---
+        outputs_tab = QWidget()
+        outputs_layout = QVBoxLayout(outputs_tab)
+        outputs_layout.setContentsMargins(6, 6, 6, 6)
+        outputs_layout.setSpacing(5)
+
+        options_row = QHBoxLayout()
+        self.exclude_masked_checkbox = QCheckBox("Leave out masked pixels")
+        self.exclude_masked_checkbox.setToolTip(
+            "Pixels hidden by greyscale masking in step 5 (pores, resin, background) are not used for the region values."
+        )
+        self.exclude_masked_checkbox.stateChanged.connect(self.on_controls_changed)
+        options_row.addWidget(self.exclude_masked_checkbox)
+        options_row.addSpacing(16)
+        self.normalize_checkbox = QCheckBox("Relative composition of selected elements (%)")
+        self.normalize_checkbox.setToolTip(
+            "The means of the selected element maps are rescaled so that they add up to 100 in every region.\n"
+            "Ratios, formulas and greyscale images are not part of the sum."
+        )
+        self.normalize_checkbox.stateChanged.connect(self.on_controls_changed)
+        options_row.addWidget(self.normalize_checkbox)
+        options_row.addStretch()
+        outputs_layout.addLayout(options_row)
+        values_row = QHBoxLayout()
+        values_row.addWidget(QLabel("Area values:"))
+        self.basis_combo = QComboBox()
+        self.basis_combo.addItems(["Scaled input values", "Modified values"])
+        self.basis_combo.setToolTip("Scaled input values are before low-value protection and conditional replacements. Ratios and formulas are recalculated using this choice.")
+        self.basis_combo.currentTextChanged.connect(self.on_controls_changed)
+        values_row.addWidget(self.basis_combo)
+        self.common_checkbox = QCheckBox("Same valid pixels for all outputs")
+        self.common_checkbox.setToolTip("Use the intersection of finite pixels and the union of applicable masks. Always on for relative composition.")
+        self.common_checkbox.toggled.connect(self.on_controls_changed)
+        values_row.addWidget(self.common_checkbox)
+        values_row.addStretch()
+        outputs_layout.addLayout(values_row)
+
+        choices=QHBoxLayout()
+        choices.addWidget(QLabel("Plot elements:"))
+        self.only_element_combo=QComboBox()
+        self.only_element_combo.currentIndexChanged.connect(self.select_single_chart_element)
+        choices.addWidget(self.only_element_combo)
+        self.all_elements_button=QPushButton("All elements")
+        self.all_elements_button.clicked.connect(lambda:self.set_chart_outputs(self.chart_element_names()))
+        choices.addWidget(self.all_elements_button)
+        self.clear_elements_button=QPushButton("Clear selection")
+        self.clear_elements_button.clicked.connect(lambda:self.set_chart_outputs([]))
+        choices.addWidget(self.clear_elements_button)
+        choices.addStretch()
+        outputs_layout.addLayout(choices)
+        self.output_table = QTableWidget(0, 3)
+        self.output_table.setHorizontalHeaderLabels(["Output", "Plot", "Unit"])
+        self.output_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.output_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.output_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.output_table.verticalHeader().setVisible(False)
+        self.output_table.setAlternatingRowColors(True)
+        self.output_table.setMinimumHeight(110)
+        self.output_table.itemChanged.connect(self.on_output_table_changed)
+        outputs_layout.addWidget(self.output_table)
+        self.tabs.addTab(outputs_tab, "Outputs")
+
+        # --- Results tab ---
+        results_tab = QWidget()
+        results_layout = QVBoxLayout(results_tab)
+        results_layout.setContentsMargins(6, 6, 6, 6)
+        results_layout.setSpacing(5)
+
+        results_row = QHBoxLayout()
+        self.results_hint = QLabel("")
+        self.results_hint.setWordWrap(True)
+        results_row.addWidget(self.results_hint, stretch=1)
+        self.copy_results_button = QPushButton("Copy results")
+        self.copy_results_button.setToolTip("Copy the table, to paste it into a spreadsheet")
+        self.copy_results_button.clicked.connect(self.copy_results)
+        results_row.addWidget(self.copy_results_button)
+        results_layout.addLayout(results_row)
+
+        self.results_table = QTableWidget(0, 0)
+        self.results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.verticalHeader().setDefaultSectionSize(26)
+        self.results_table.setMinimumHeight(130)
+        results_layout.addWidget(self.results_table)
+        self.tabs.addTab(results_tab, "Results")
+
+        # --- Style tab ---
+        style_tab = QWidget()
+        style_layout = QVBoxLayout(style_tab)
+        style_layout.setContentsMargins(6, 6, 6, 6)
+        style_layout.setSpacing(5)
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("Image title:"))
+        self.image_title_edit = QLineEdit()
+        self.image_title_edit.setPlaceholderText("Optional title above the map")
+        self.image_title_edit.textChanged.connect(self.on_controls_changed)
+        title_row.addWidget(self.image_title_edit, stretch=1)
+        title_row.addWidget(QLabel("Chart title:"))
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("Optional title above the chart")
+        self.title_edit.textChanged.connect(self.on_controls_changed)
+        title_row.addWidget(self.title_edit, stretch=1)
+        style_layout.addLayout(title_row)
+
+        axis_row = QHBoxLayout()
+        axis_row.addWidget(QLabel("Y label:"))
+        self.y_label_edit = QLineEdit()
+        self.y_label_edit.setPlaceholderText("Automatic; for example Mean (at%)")
+        self.y_label_edit.textChanged.connect(self.on_controls_changed)
+        axis_row.addWidget(self.y_label_edit, stretch=1)
+        axis_row.addWidget(QLabel("Right Y label (ratios):"))
+        self.right_y_label_edit = QLineEdit()
+        self.right_y_label_edit.setPlaceholderText("Automatic")
+        self.right_y_label_edit.textChanged.connect(self.on_controls_changed)
+        axis_row.addWidget(self.right_y_label_edit, stretch=1)
+        style_layout.addLayout(axis_row)
+
+        chart_row = QHBoxLayout()
+        chart_row.addWidget(QLabel("Error bars:"))
+        self.error_bars_combo = QComboBox()
+        self.error_bars_combo.addItems(AREA_ERROR_BAR_OPTIONS)
+        self.error_bars_combo.setToolTip("Show the standard deviation of the pixel values of each region as error bars.")
+        self.error_bars_combo.currentTextChanged.connect(self.on_controls_changed)
+        chart_row.addWidget(self.error_bars_combo)
+        chart_row.addSpacing(12)
+        chart_row.addWidget(QLabel("Legend:"))
+        self.legend_position_combo = QComboBox()
+        self.legend_position_combo.addItems(["Inside plot", "Outside right"])
+        self.legend_position_combo.currentTextChanged.connect(self.on_controls_changed)
+        chart_row.addWidget(self.legend_position_combo)
+        chart_row.addSpacing(12)
+        self.region_labels_checkbox = QCheckBox("Region names on the map")
+        self.region_labels_checkbox.stateChanged.connect(self.on_controls_changed)
+        chart_row.addWidget(self.region_labels_checkbox)
+        chart_row.addWidget(QLabel("Fill opacity:"))
+        self.fill_opacity=QSpinBox()
+        self.fill_opacity.setRange(0,60);self.fill_opacity.setSuffix(" %")
+        self.fill_opacity.valueChanged.connect(self.on_controls_changed)
+        chart_row.addWidget(self.fill_opacity)
+        chart_row.addStretch()
+        style_layout.addLayout(chart_row)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Number size:"))
+        self.tick_size_combo = QComboBox()
+        self.tick_size_combo.addItems(TICK_LABEL_SIZE_OPTIONS)
+        self.tick_size_combo.setToolTip("Font size of the chart axis numbers. 'Default' keeps the normal size.")
+        self.tick_size_combo.currentTextChanged.connect(self.on_controls_changed)
+        size_row.addWidget(self.tick_size_combo)
+        size_row.addSpacing(12)
+        size_row.addWidget(QLabel("Text size:"))
+        self.text_size_combo = QComboBox()
+        self.text_size_combo.addItems(TICK_LABEL_SIZE_OPTIONS)
+        self.text_size_combo.setToolTip("Font size of the text labels (axis labels, titles, legend and region names). 'Default' keeps the normal size.")
+        self.text_size_combo.currentTextChanged.connect(self.on_controls_changed)
+        size_row.addWidget(self.text_size_combo)
+        size_row.addStretch()
+        style_layout.addLayout(size_row)
+
+        style_layout.addStretch()
+        self.tabs.addTab(style_tab, "Style")
+
+        layout.addWidget(self.tabs)
+
+        self.status_label = QLabel("Choose a shape and draw a region on the map.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        set_page_layout(self, layout)
+        self.update_drawing_buttons()
+
+    def stop_area_navigation(self):
+        for toolbar in (self.navigation, self.detail_navigation):
+            if str(toolbar.mode) == "pan/zoom":
+                toolbar.pan()
+            elif toolbar.mode:
+                toolbar.zoom()
+
+    def activate_drawing(self, *_):
+        if self._updating_controls or self._mode_switching:
+            return
+        self._mode_switching = True
+        try:
+            self.cancel_area_interaction()
+            self._detail_drag = None
+            self.stop_area_navigation()
+            self.edit_checkbox.setChecked(False)
+            self.detail_box_button.setChecked(False)
+        finally:
+            self._mode_switching = False
+        self.clear_region_hover()
+        self.draw_detail_window()
+        self.update_drawing_buttons()
+        self.refresh_preview_artists()
+        self.status_label.setText(self.drawing_hint())
+
+    def on_area_navigation_changed(self, toolbar):
+        if self._mode_switching:
+            return
+        self._mode_switching = True
+        try:
+            if toolbar.mode:
+                self.cancel_area_interaction()
+                self._detail_drag = None
+                self.edit_checkbox.setChecked(False)
+                self.detail_box_button.setChecked(False)
+                other = self.detail_navigation if toolbar is self.navigation else self.navigation
+                if str(other.mode) == "pan/zoom":
+                    other.pan()
+                elif other.mode:
+                    other.zoom()
+        finally:
+            self._mode_switching = False
+        self.clear_region_hover()
+        self.draw_detail_window()
+        self.update_drawing_buttons()
+        self.refresh_preview_artists()
+        if toolbar.mode:
+            self.status_label.setText("Drag to " + ("pan" if str(toolbar.mode) == "pan/zoom" else "zoom")
+                + ". Click Draw to draw the selected shape again.")
+        else:
+            self.status_label.setText(self.drawing_hint())
+
+    def update_interaction_feedback(self):
+        if not hasattr(self, "mode_label"):
+            return
+        aa = self.state.area_analysis_settings if self.wizard() is not None else None
+        detail_open = bool(aa and aa.detail_enabled)
+        navigation = next((t for t in (self.navigation, self.detail_navigation) if t.mode), None)
+        drawing = navigation is None and not self.edit_checkbox.isChecked() and not self.detail_box_button.isChecked()
+        self.draw_button.setChecked(drawing)
+        if navigation is not None:
+            mode = "Pan" if str(navigation.mode) == "pan/zoom" else "Zoom"
+            mode += " — detail map" if navigation is self.detail_navigation else " — overview"
+            label = f"Mode: {mode}. Click Draw to draw regions."
+        elif self.detail_box_button.isChecked():
+            label = "Mode: Set / move detail box — overview. Click Draw to draw regions."
+        elif self.edit_checkbox.isChecked():
+            label = "Mode: Edit regions — drag an outline or its white handles."
+        else:
+            label = f"Mode: Draw {self.shape_combo.currentText()}"
+            label += " — either map." if detail_open else " — overview."
+        self.mode_label.setText(label)
+        if not navigation:
+            cursor = Qt.OpenHandCursor if self.edit_checkbox.isChecked() else Qt.CrossCursor
+            self.combined_canvas.setCursor(cursor)
+            self.detail_canvas.setCursor(cursor)
+
+    def clear_region_hover(self, *_):
+        self._hover_region_id = None
+        for artist in self._hover_artists:
+            try:
+                artist.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        if self._hover_artists:
+            self.combined_canvas.draw_idle()
+            self.detail_canvas.draw_idle()
+        self._hover_artists = []
+
+    def update_region_hover(self, event):
+        axis = self.map_axes_for_event(event)
+        if (axis is None or event.xdata is None or event.ydata is None
+                or self._drawing is not None or self._edit_drag is not None
+                or self._detail_drag is not None or self.detail_box_button.isChecked()
+                or self.navigation.mode or self.detail_navigation.mode):
+            self.clear_region_hover()
+            return
+        regions = self.state.area_analysis_settings.regions
+        found = None
+        for region in reversed(regions):
+            outline = area_region_outline(region)
+            if len(outline) < 3:
+                continue
+            # Test the outline first so thin regions remain easy to find.
+            screen = axis.transData.transform(outline)
+            a, b = screen[:-1], screen[1:]
+            vector = b - a
+            fraction = np.clip(np.sum(([event.x, event.y] - a) * vector, axis=1)
+                / np.maximum(np.sum(vector * vector, axis=1), 1e-12), 0, 1)
+            near = np.min(np.linalg.norm(a + fraction[:, None] * vector - [event.x, event.y], axis=1)) <= 7
+            if near or MplPath(outline).contains_point((event.xdata, event.ydata)):
+                found = region
+                break
+        if found is None:
+            self.clear_region_hover()
+            return
+        if found.region_id == self._hover_region_id:
+            return
+        self.clear_region_hover()
+        self._hover_region_id = found.region_id
+        outline = area_region_outline(found)
+        axes = [self.map_ax] + ([self.detail_map_ax] if self.state.area_analysis_settings.detail_enabled else [])
+        for target in axes:
+            if target is None:
+                continue
+            self._hover_artists.extend(target.plot(outline[:, 0], outline[:, 1],
+                color=found.color, linewidth=3.5, solid_joinstyle="round", zorder=43,
+                scalex=False, scaley=False,
+                path_effects=[patheffects.withStroke(linewidth=5.1, foreground="black")]))
+            target.figure.canvas.draw_idle()
+
+
+    def remember_area_edit(self, before):
+        current=dict(regions=[asdict(r) for r in self.state.area_analysis_settings.regions],
+                     grid_signature=self.state.area_analysis_settings.grid_signature)
+        if before != current:
+            self._undo_history.append(copy.deepcopy(before))
+            self._undo_history=self._undo_history[-30:]
+        self.undo_button.setEnabled(bool(self._undo_history))
+
+
+    def area_edit_snapshot(self):
+        aa=self.state.area_analysis_settings
+        return copy.deepcopy(dict(regions=[asdict(r) for r in aa.regions],grid_signature=aa.grid_signature))
+
+
+    def undo_area_edit(self):
+        if not self._undo_history:
+            return
+        old=self._undo_history.pop()
+        aa=self.state.area_analysis_settings
+        aa.regions=[AreaRegion(**r) for r in old["regions"]]
+        aa.grid_signature=old["grid_signature"]
+        self._drawing=None;self._edit_drag=None
+        self.redraw_all(select_row=-1)
+        self.undo_button.setEnabled(bool(self._undo_history))
+        self.status_label.setText("Last region change undone.")
+
+
+    def adopt_area_grid(self):
+        aa=self.state.area_analysis_settings
+        try:
+            signature,_=self.wizard().engine.area_grid_info(self.output_arrays_cache,self.raw_arrays_cache,check_saved=False)
+        except ValueError as exc:
+            self.status_label.setText(str(exc));return
+        before=self.area_edit_snapshot()
+        aa.grid_signature=signature
+        self.remember_area_edit(before)
+        self._map_view=None
+        self.redraw_all()
+        self.status_label.setText("Existing outline coordinates are now assigned to the current grid. Review their positions on the image.")
+
+
+    def on_edit_toggled(self, checked):
+        if self._mode_switching:
+            return
+        self._mode_switching = True
+        try:
+            self._detail_drag = None
+            self.cancel_area_interaction()
+            if checked:
+                self.detail_box_button.setChecked(False)
+                self.stop_area_navigation()
+        finally:
+            self._mode_switching = False
+        self.clear_region_hover()
+        self.draw_detail_window()
+        self.update_drawing_buttons()
+        self.status_label.setText("Select an outline, then drag it to move it. Drag a white handle to edit its shape." if checked else self.drawing_hint())
+        self.refresh_preview_artists()
+
+
+    def handle_area_edit_press(self,event):
+        axis=self.map_axes_for_event(event)
+        if axis is None:
+            return
+        regions=self.state.area_analysis_settings.regions
+        index=self.selected_region_index()
+        handle=None
+        if index is not None and 0<=index<len(regions):
+            coords=area_points_array(regions[index].points)
+            distance=np.hypot(*(axis.transData.transform(coords)-[event.x,event.y]).T)
+            if len(distance) and distance.min()<=10:
+                handle=int(distance.argmin())
+        if handle is None:
+            index=None
+            for i in reversed(range(len(regions))):
+                outline=area_region_outline(regions[i])
+                if len(outline)<3:continue
+                screen=axis.transData.transform(outline)
+                a,b=screen[:-1],screen[1:]
+                v=b-a;length=np.sum(v*v,axis=1)
+                t=np.clip(np.sum(([event.x,event.y]-a)*v,axis=1)/np.maximum(length,1e-12),0,1)
+                near=np.min(np.linalg.norm(a+t[:,None]*v-[event.x,event.y],axis=1))<=8
+                if near or MplPath(outline).contains_point((event.xdata,event.ydata)):
+                    index=i;break
+        if index is None:
+            self.region_table.clearSelection();self.refresh_preview_artists();return
+        self.region_table.selectRow(index)
+        original=copy.deepcopy(regions[index])
+        self._edit_drag=dict(index=index,handle=handle,start=(event.xdata,event.ydata),original=original,
+                             candidate=copy.deepcopy(original),before=self.area_edit_snapshot())
+
+
+    def handle_area_edit_move(self,event):
+        edit=self._edit_drag
+        if edit is None:return
+        point=self.event_point(event)
+        if point is None:return
+        region=edit["original"];pts=area_points_array(region.points).copy()
+        rows,cols=self.base_shape()
+        if edit["handle"] is None:
+            delta=np.asarray(point)-edit["start"]
+            delta=np.maximum(delta,-pts.min(axis=0))
+            delta=np.minimum(delta,np.array([cols-1,rows-1])-pts.max(axis=0))
+            pts+=delta
+        else:
+            index=edit["handle"]
+            if normalize_area_shape(region.shape) in ("Square","Circle"):
+                other=1-index
+                point=square_second_corner(*pts[other],*point,self.base_shape())
+            pts[index]=point
+        edit["candidate"].points=[[round(float(x),2),round(float(y),2)] for x,y in pts]
+        self.refresh_preview_artists()
+
+
+    def handle_area_edit_release(self):
+        edit=self._edit_drag;self._edit_drag=None
+        if edit is None:return
+        regions=self.state.area_analysis_settings.regions
+        index=next((i for i,r in enumerate(regions) if r.region_id==edit["original"].region_id),None)
+        if index is None:
+            self.refresh_preview_artists();self.status_label.setText("The edited region no longer exists; the edit was cancelled.");return
+        candidate=edit["candidate"]
+        if not area_region_is_complete(candidate) or not area_region_mask(candidate,self.base_shape()).any():
+            self.status_label.setText("That edit would enclose no area; the previous outline was retained.")
+            self.refresh_preview_artists();return
+        # Retain name/colour changes made through the table during an edit.
+        candidate.name=regions[index].name;candidate.color=regions[index].color
+        regions[index]=candidate
+        self.remember_area_edit(edit["before"])
+        self.redraw_all(select_row=index)
+        self.status_label.setText(f"'{candidate.name}' updated. Undo restores its previous outline.")
+
+
+    def fit_area_view(self):
+        if self.map_ax is None or self.base_shape() is None:return
+        rows,cols=self.base_shape()
+        self.map_ax.set_xlim(-.5,cols-.5);self.map_ax.set_ylim(rows-.5,-.5)
+        self._map_view=None
+        self.combined_canvas.draw_idle()
+
+
+    def on_area_scroll(self,event):
+        aa=self.state.area_analysis_settings
+        axis=self.map_axes_for_event(event)
+        if axis is None or self._drawing is not None or self._edit_drag is not None or self._detail_drag is not None:return
+        if event.xdata is None or event.ydata is None:return
+        factor=.8 if event.button=="up" else 1.25
+        rows,cols=self.base_shape();x,y=event.xdata,event.ydata
+        if aa.detail_enabled:
+            if self._detail_nav_timer.isActive():
+                self._detail_nav_timer.stop();self.sync_detail_navigation()
+            if self.detail_map_ax is not None:self.detail_navigation.push_current()
+            x0,x1,y0,y1=self.valid_detail_bounds()
+            if axis is self.map_ax:
+                width=(x1-x0)*factor;height=(y1-y0)*factor
+                bounds=[x-width/2,x+width/2,y-height/2,y+height/2]
+            else:bounds=[x+(x0-x)*factor,x+(x1-x)*factor,y+(y0-y)*factor,y+(y1-y)*factor]
+            aa.detail_bounds=self.wizard().engine.bounded_map_view(bounds,(rows,cols))
+            self.refresh_detail_views()
+            self.detail_navigation.push_current()
+            return
+        old=list(axis.get_xlim())+sorted(axis.get_ylim())
+        bounds=self.wizard().engine.bounded_map_view([x+(old[0]-x)*factor,x+(old[1]-x)*factor,
+            y+(old[2]-y)*factor,y+(old[3]-y)*factor],(rows,cols))
+        if np.allclose(old,bounds):return
+        self.navigation.push_current()
+        axis.set_xlim(bounds[:2]);axis.set_ylim(bounds[3],bounds[2])
+        self.navigation.push_current();self.combined_canvas.draw_idle()
+
+
+    def on_area_resize(self,event):
+        if hasattr(self,"_resize_timer"):
+            self._resize_timer.start(80)
+
+
+    def resize_area_preview(self):
+        # Changing Qt constraints inside Matplotlib's resize event leaves the
+        # Figure at the old size. Apply constraints after that event completes.
+        if self.wizard() is not None:
+            target=max(230,min(400,self.wizard().height()-400))
+            if self.combined_canvas.maximumHeight()!=target:
+                self.combined_canvas.setMaximumHeight(target)
+                self._resize_timer.start(80)
+                return
+        canvas=self.combined_canvas
+        ratio=canvas.device_pixel_ratio
+        self.combined_figure.set_size_inches(canvas.width()*ratio/self.combined_figure.dpi,
+                                             canvas.height()*ratio/self.combined_figure.dpi,forward=False)
+        self.draw_combined_preview()
+
+    def chart_element_names(self):
+        named=self.state.get_named_files()
+        return [n for n in self.state.get_ordered_names() if not is_grayscale_name(n)
+                and source_type_for_display(self.state,named[n]).lower()!="video"]
+
+
+    def chart_output_names(self):
+        return list(dict.fromkeys(self.chart_element_names()+self.state.get_output_names()))
+
+
+    def set_chart_outputs(self,names):
+        wanted=set(names)
+        self.output_table.blockSignals(True)
+        for i in range(self.output_table.rowCount()):
+            self.output_table.item(i,1).setCheckState(Qt.Checked if self.output_table.item(i,0).text() in wanted else Qt.Unchecked)
+        self.output_table.blockSignals(False)
+        self.state.area_analysis_settings.plot_selection_initialized=True
+        self.on_output_table_changed(None)
+
+
+    def select_single_chart_element(self,index):
+        if self._updating_controls or index<=0:return
+        name=self.only_element_combo.itemData(index)
+        if name:self.set_chart_outputs([name])
+        self.only_element_combo.blockSignals(True);self.only_element_combo.setCurrentIndex(0);self.only_element_combo.blockSignals(False)
+
+
+    def choose_chart_elements(self):
+        self.tabs.setCurrentIndex(1)
+        self.output_table.setFocus()
+
+
+    def cancel_area_interaction(self):
+        self._drawing=None;self._edit_drag=None
+        self.clear_preview_artists()
+
+
+    def refresh_area_export_buttons(self):
+        pending=self._drawing is not None or self._edit_drag is not None or self._detail_drag is not None
+        has_map=bool(self.output_arrays_cache) and self.base_output_combo.currentText() in self.output_arrays_cache
+        if hasattr(self,"map_csv_button"):
+            self.map_csv_button.setEnabled(has_map and bool(self.state.area_analysis_settings.regions) and not pending)
+            self.map_image_button.setEnabled(has_map and not pending)
+            ready=self._last_result is not None and not pending
+            self.chart_csv_button.setEnabled(ready);self.chart_image_button.setEnabled(ready)
+            self.chart_excel_button.setEnabled(ready)
+        if hasattr(self,"detail_excel_button"):
+            self.detail_excel_button.setEnabled(bool(self.wizard() is not None and self.state.area_analysis_settings.detail_enabled and self._detail_result
+                and self._detail_result["regions"] and not pending))
+
+
+    def export_area_chart_csv(self):
+        if self._last_result is None:return
+        snapshot=copy.deepcopy(self._last_result)
+        run_quick_export(self,"area_chart_data","csv",lambda path:self.wizard().engine.save_area_analysis_csv(snapshot,path))
+
+
+    def export_area_chart_excel(self):
+        if self._last_result is None or not self._last_result["regions"]:return
+        result=copy.deepcopy(self._last_result)
+        context=copy.deepcopy(project_dict(self.state))
+        engine=ProcessingEngine(copy.deepcopy(self.state))
+        arrays=self.output_arrays_cache
+        raw=self.raw_arrays_cache
+        run_quick_export(self,"area_analysis_report","xlsx",
+            lambda path:engine.save_area_analysis_excel(result,path,context,arrays,raw))
+
+    def export_detail_chart_excel(self):
+        if self._detail_result is None or not self._detail_result["regions"]:return
+        result=copy.deepcopy(self._detail_result)
+        context=copy.deepcopy(project_dict(self.state))
+        engine=ProcessingEngine(copy.deepcopy(self.state))
+        arrays=self.output_arrays_cache
+        raw=self.raw_arrays_cache
+        run_quick_export(self,"detail_analysis_report","xlsx",
+            lambda path:engine.save_area_analysis_excel(result,path,context,arrays,raw))
+
+    def export_area_chart_image(self):
+        if self._last_result is None:return
+        snapshot=copy.deepcopy(self._last_result)
+        run_quick_export(self,"area_chart","png",lambda path:self.wizard().engine.save_area_analysis_figure(snapshot,path,dpi=self.state.figure_dpi))
+
+
+    def export_area_regions_csv(self):
+        try:snapshot=self.wizard().engine.area_map_snapshot(self.output_arrays_cache,self.raw_arrays_cache)
+        except ValueError as exc:QMessageBox.warning(self,"Regions unavailable",str(exc));return
+        run_quick_export(self,"area_regions","csv",lambda path:self.wizard().engine.save_area_regions_csv(snapshot,path))
+
+
+    def export_area_map_image(self):
+        try:self.wizard().engine.area_map_snapshot(self.output_arrays_cache,self.raw_arrays_cache)
+        except ValueError as exc:QMessageBox.warning(self,"Map unavailable",str(exc));return
+        view=(self.map_ax.get_xlim(),self.map_ax.get_ylim())
+        run_quick_export(self,self.base_output_combo.currentText()+"_regions","png",
+            lambda path:self.wizard().engine.save_area_map_figure(self.output_arrays_cache,self.raw_arrays_cache,path,view,self.state.figure_dpi))
+
+    def map_axes_for_event(self,event):
+        if event.inaxes is self.map_ax:return self.map_ax
+        if self.state.area_analysis_settings.detail_enabled and event.inaxes is self.detail_map_ax:return self.detail_map_ax
+        return None
+
+
+    def active_map_navigation(self):
+        return self.detail_navigation if self.detail_map_ax is not None and self._interaction_ax is self.detail_map_ax else self.navigation
+
+
+    def valid_detail_bounds(self):
+        shape=self.base_shape()
+        if shape is None:return None
+        aa=self.state.area_analysis_settings
+        bounds=aa.detail_bounds
+        if len(bounds)!=4:
+            rows,cols=shape
+            bounds=[cols*.25-.5,cols*.75-.5,rows*.25-.5,rows*.75-.5]
+        aa.detail_bounds=self.wizard().engine.bounded_map_view(bounds,shape)
+        return aa.detail_bounds
+
+
+    def on_detail_toggled(self,checked):
+        if self._updating_controls:return
+        self.cancel_area_interaction();self._detail_drag=None
+        self.state.area_analysis_settings.detail_enabled=bool(checked)
+        if checked:
+            self.valid_detail_bounds()
+            self.fit_area_view()
+        else:
+            self.detail_box_button.setChecked(False)
+            if self.detail_navigation.mode:
+                self.detail_navigation.pan() if str(self.detail_navigation.mode)=="pan/zoom" else self.detail_navigation.zoom()
+            self._detail_timer.stop();self._detail_nav_timer.stop()
+        self.navigation.update()
+        self.draw_combined_preview()
+        self.status_label.setText("Detail view opened below. Set or drag the overview box; draw regions in either map."
+                                  if checked else "Detail view closed. Fit map restores the overview.")
+
+
+    def on_detail_box_mode(self,checked):
+        if self._updating_controls or self._mode_switching:
+            return
+        self._mode_switching = True
+        try:
+            self.cancel_area_interaction()
+            self._detail_drag = None
+            if checked:
+                if not self.detail_view_checkbox.isChecked():
+                    self.detail_view_checkbox.setChecked(True)
+                self.edit_checkbox.setChecked(False)
+                self.stop_area_navigation()
+        finally:
+            self._mode_switching = False
+        self.clear_region_hover()
+        self.draw_detail_window()
+        self.update_drawing_buttons()
+        self.status_label.setText("Drag a new box on the overview, drag inside it to move it, or drag a corner to resize. Click Draw to draw regions."
+                                  if checked else self.drawing_hint())
+
+
+    def reset_detail_view(self):
+        shape=self.base_shape()
+        if shape is None:return
+        rows,cols=shape
+        self.state.area_analysis_settings.detail_bounds=[-.5,cols-.5,-.5,rows-.5]
+        self.refresh_detail_views()
+
+
+    def on_detail_region_mode(self,text):
+        if self._updating_controls:return
+        aa=self.state.area_analysis_settings
+        if text=="Checked regions" and not aa.detail_region_ids and self._detail_result is not None:
+            aa.detail_region_ids=[r["region_id"] for r in self._detail_result["regions"]]
+        self.state.area_analysis_settings.detail_region_mode=text
+        self.draw_detail_panel()
+
+
+    def on_detail_region_check(self,item):
+        aa=self.state.area_analysis_settings
+        if aa.detail_region_mode!="Checked regions":
+            aa.detail_region_ids=[r["region_id"] for r in self._detail_result["regions"]] if self._detail_result else []
+        region=self.state.area_analysis_settings.regions[item.row()]
+        ids=set(aa.detail_region_ids)
+        if item.checkState()==Qt.Checked:ids.add(region.region_id)
+        else:ids.discard(region.region_id)
+        aa.detail_region_ids=sorted(ids);aa.detail_region_mode="Checked regions"
+        self.detail_region_combo.blockSignals(True);self.detail_region_combo.setCurrentText("Checked regions");self.detail_region_combo.blockSignals(False)
+
+
+    def draw_detail_window(self):
+        for artist in self._detail_window_artists:
+            try:artist.remove()
+            except (ValueError,NotImplementedError):pass
+        self._detail_window_artists=[]
+        aa=self.state.area_analysis_settings
+        if not aa.detail_enabled or self.map_ax is None:return
+        bounds=self.valid_detail_bounds()
+        if bounds is None:return
+        x0,x1,y0,y1=bounds
+        outline=np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1],[x0,y0]])
+        self._detail_window_artists.extend(self.map_ax.plot(outline[:,0],outline[:,1],color="white",linestyle="--",
+            linewidth=1.5,zorder=70,scalex=False,scaley=False,
+            path_effects=[patheffects.withStroke(linewidth=3.2,foreground="black")]))
+        self._detail_window_artists.append(self.map_ax.text(x0,y0,"Detail view",color="white",fontsize=8,va="bottom",
+            bbox=dict(facecolor="black",alpha=.8,edgecolor="none",pad=2),zorder=72,clip_on=True))
+        if self.detail_box_button.isChecked():
+            self._detail_window_artists.extend(self.map_ax.plot(outline[:4,0],outline[:4,1],linestyle="none",marker="s",
+                markersize=5,markerfacecolor="white",markeredgecolor="black",zorder=73,scalex=False,scaley=False))
+
+
+    def detail_box_press(self,event):
+        point=np.array([event.xdata,event.ydata],dtype=float)
+        bounds=self.valid_detail_bounds()
+        x0,x1,y0,y1=bounds
+        corners=np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]])
+        distance=np.linalg.norm(self.map_ax.transData.transform(corners)-[event.x,event.y],axis=1)
+        handle=int(distance.argmin()) if distance.min()<=10 else None
+        kind="corner" if handle is not None else "move" if x0<=point[0]<=x1 and y0<=point[1]<=y1 else "new"
+        self._detail_drag=dict(kind=kind,handle=handle,start=point,bounds=list(bounds))
+
+
+    def detail_box_move(self,event):
+        drag=self._detail_drag
+        if drag is None:return
+        point=self.map_ax.transData.inverted().transform((event.x,event.y))
+        rows,cols=self.base_shape()
+        point=np.clip(point,[-.5,-.5],[cols-.5,rows-.5])
+        x0,x1,y0,y1=drag["bounds"]
+        if drag["kind"]=="move":
+            delta=point-drag["start"]
+            delta=np.clip(delta,[-.5-x0,-.5-y0],[cols-.5-x1,rows-.5-y1])
+            bounds=[x0+delta[0],x1+delta[0],y0+delta[1],y1+delta[1]]
+        elif drag["kind"]=="corner":
+            opposite=np.array([[x1,y1],[x0,y1],[x0,y0],[x1,y0]])[drag["handle"]]
+            bounds=[min(point[0],opposite[0]),max(point[0],opposite[0]),min(point[1],opposite[1]),max(point[1],opposite[1])]
+        else:
+            start=drag["start"]
+            bounds=[min(point[0],start[0]),max(point[0],start[0]),min(point[1],start[1]),max(point[1],start[1])]
+        self.state.area_analysis_settings.detail_bounds=self.wizard().engine.bounded_map_view(bounds,(rows,cols))
+        self.draw_detail_window();self.combined_canvas.draw_idle();self._detail_timer.start(45)
+
+
+    def detail_box_release(self,event):
+        self.detail_box_move(event);self._detail_drag=None;self._detail_timer.stop()
+        self.refresh_detail_views()
+
+
+    def refresh_detail_views(self):
+        self.draw_detail_window();self.draw_detail_panel();self.combined_canvas.draw_idle()
+
+
+    def draw_detail_panel(self):
+        self.clear_region_hover()
+        self.update_interaction_feedback()
+        aa=self.state.area_analysis_settings
+        enabled=bool(aa.detail_enabled and self.base_shape() is not None)
+        self.detail_panel.setVisible(enabled)
+        for widget in (self.detail_box_button,self.detail_reset_button,self.detail_close_button):widget.setEnabled(enabled)
+        self.map_ax.set_navigate(not enabled) if self.map_ax is not None else None
+        if not enabled:
+            self._detail_result=None
+            return
+        bounds=self.valid_detail_bounds()
+        engine=self.wizard().engine
+        fig=self.detail_figure
+        self._detail_limits_guard=True
+        if self.detail_map_ax is not None and self.detail_map_ax in fig.axes:
+            for axis in list(fig.axes):
+                if axis is not self.detail_map_ax:axis.remove()
+            self.detail_map_ax.clear()
+        else:self.detail_map_ax=fig.add_axes([.11,.21,.43,.67])
+        self.detail_map_ax.set_position([.11,.21,.43,.67])
+        chart=fig.add_axes([.665,.21,.24,.67]);self.detail_chart_ax=chart
+        colorbar=fig.add_axes([.085,.21,.012,.67])
+        try:
+            engine.plot_area_analysis_map_axis(self.detail_map_ax,colorbar,self.output_arrays_cache,self.raw_arrays_cache,
+                selected_index=self.selected_region_index(),pixel_size_um=self.base_pixel_size_um(),view_bounds=bounds)
+            self.detail_map_ax.set_xlim(bounds[:2]);self.detail_map_ax.set_ylim(bounds[3],bounds[2])
+            self.detail_map_ax.set_title("Enlarged detail",fontsize=10)
+        except Exception as exc:
+            self.detail_map_ax.text(.5,.5,str(exc),ha="center",va="center",transform=self.detail_map_ax.transAxes,wrap=True)
+        self._detail_result=None
+        if self._last_result is not None:
+            try:
+                self._detail_result=engine.detail_area_result(self._last_result)
+                engine.plot_area_analysis_axis(chart,self._detail_result)
+            except ValueError as exc:
+                chart.text(.5,.5,str(exc),ha="center",va="center",transform=chart.transAxes,wrap=True)
+        else:
+            chart.text(.5,.5,self._result_message or "Draw a region in the detail map",ha="center",va="center",
+                       transform=chart.transAxes,wrap=True);chart.set_axis_off()
+        fig.canvas.draw()
+        map_position=self.detail_map_ax.get_position()
+        colorbar.set_position([map_position.x0-.025,map_position.y0,.012,map_position.height])
+        chart_position=chart.get_position()
+        chart.set_position([chart_position.x0,map_position.y0,chart_position.width,map_position.height])
+        right=getattr(chart,"_elementti_right_axis",None)
+        if right is not None:right.set_position(chart.get_position())
+        fit_area_chart_legend(chart)
+        count=len(self._detail_result["regions"]) if self._detail_result else 0
+        self.detail_status.setText(f"{count} regions in this chart. Values use complete regions, including parts outside this view. "
+                                  "Zooming alone does not change composition. Use ‘Analyse this zoom area’ to create a new region.")
+        ready=bool(count and self._drawing is None and self._edit_drag is None and self._detail_drag is None)
+        self.detail_csv_button.setEnabled(ready);self.detail_chart_image_button.setEnabled(ready)
+        self.detail_excel_button.setEnabled(ready)
+        self.detail_regions_csv_button.setEnabled(bool(aa.regions) and self._detail_drag is None)
+        self.detail_map_image_button.setEnabled(self._detail_drag is None)
+        self.detail_analyse_button.setEnabled(self._detail_drag is None)
+        if self.detail_navigation._nav_stack() is None:self.detail_navigation.push_current()
+        self.detail_map_ax.callbacks.connect("xlim_changed",self.on_detail_map_limits)
+        self.detail_map_ax.callbacks.connect("ylim_changed",self.on_detail_map_limits)
+        self._detail_limits_guard=False
+        self.refresh_preview_artists()
+
+
+    def on_detail_navigation_release(self,event):
+        if not self.detail_navigation.mode or self.detail_map_ax is None:return
+        self.sync_detail_navigation()
+
+
+    def sync_detail_navigation(self):
+        if not self.state.area_analysis_settings.detail_enabled or self.detail_map_ax is None:return
+        bounds=list(self.detail_map_ax.get_xlim())+sorted(self.detail_map_ax.get_ylim())
+        bounds=self.wizard().engine.bounded_map_view(bounds,self.base_shape())
+        if np.allclose(bounds,self.state.area_analysis_settings.detail_bounds):return
+        self.state.area_analysis_settings.detail_bounds=bounds
+        self.refresh_detail_views()
+
+
+    def on_detail_map_limits(self,*_):
+        if self._detail_limits_guard or self.detail_map_ax is None:return
+        self._detail_nav_timer.start(45)
+
+
+    def analyse_detail_area(self):
+        bounds=self.valid_detail_bounds()
+        if bounds is None:return
+        rows,cols=self.base_shape();x0,x1,y0,y1=bounds
+        before=len(self.state.area_analysis_settings.regions)
+        self.finish_region("Rectangle",[[max(0,x0),max(0,y0)],[min(cols-1,x1),min(rows-1,y1)]])
+        regions=self.state.area_analysis_settings.regions
+        if len(regions)>before:
+            region=regions[-1]
+            region.name=unique_area_region_name([r.name for r in regions[:-1]],"Detail area")
+            if region.region_id not in self.state.area_analysis_settings.detail_region_ids:
+                self.state.area_analysis_settings.detail_region_ids.append(region.region_id)
+            self.redraw_all(select_row=len(regions)-1)
+
+
+    def export_detail_chart_csv(self):
+        if self._detail_result is None:return
+        result=copy.deepcopy(self._detail_result)
+        run_quick_export(self,"detail_chart_data","csv",lambda p:self.wizard().engine.save_area_analysis_csv(result,p))
+
+
+    def export_detail_chart_image(self):
+        if self._detail_result is None:return
+        result=copy.deepcopy(self._detail_result)
+        run_quick_export(self,"detail_chart","png",lambda p:self.wizard().engine.save_area_analysis_figure(result,p,dpi=self.state.figure_dpi))
+
+
+    def export_detail_regions_csv(self):
+        try:result=self.wizard().engine.detail_map_snapshot(self.output_arrays_cache,self.raw_arrays_cache)
+        except ValueError as exc:QMessageBox.warning(self,"Detail unavailable",str(exc));return
+        run_quick_export(self,"detail_regions","csv",lambda p:self.wizard().engine.save_area_regions_csv(result,p))
+
+
+    def export_detail_map_image(self):
+        try:self.wizard().engine.detail_map_snapshot(self.output_arrays_cache,self.raw_arrays_cache)
+        except ValueError as exc:QMessageBox.warning(self,"Detail unavailable",str(exc));return
+        run_quick_export(self,"detail_map","png",lambda p:self.wizard().engine.save_detail_map_figure(
+            self.output_arrays_cache,self.raw_arrays_cache,p,dpi=self.state.figure_dpi))
+
+
+    def cleanupPage(self):
+        self._detail_timer.stop();self._detail_nav_timer.stop();self._resize_timer.stop()
+        self._detail_drag=None;self.cancel_area_interaction()
+        self.clear_region_hover()
+        self.stop_area_navigation()
+        super().cleanupPage()
+
+    def make_help_button(self, title: str, text: str) -> QPushButton:
+        button = QPushButton("Read instructions")
+        button.setFixedWidth(105)
+        button.setToolTip(title)
+        button.clicked.connect(lambda _checked=False, t=title, m=text: show_help(self, t, "## This page\n" + m))
+        return button
+
+    @property
+    def state(self) -> AppState:
+        return self.wizard().state
+
+    # -- setting up ------------------------------------------------------------
+
+    def initializePage(self):
+        self.state.prune_area_analysis_settings_to_current_outputs()
+        self._detail_drag=None
+        self._interaction_ax=None
+        self.detail_navigation.update()
+        self.detail_box_button.blockSignals(True);self.detail_box_button.setChecked(False);self.detail_box_button.blockSignals(False)
+        self._drawing = None
+        self._edit_drag = None
+        self._undo_history = []
+        self.undo_button.setEnabled(False)
+        self._map_view = None
+        self._has_area_view = False
+        self.populate_controls()
+        self.activate_drawing()
+
+        try:
+            self.load_data_cache()
+            self.fit_regions_to_background()
+            self.status_label.setText(self._grid_message or self.drawing_hint())
+        except Exception as e:
+            self.raw_arrays_cache = {}
+            self.output_arrays_cache = {}
+            QMessageBox.warning(
+                self,
+                "Could not prepare area-analysis preview",
+                f"The app could not prepare the area-analysis preview.\n\n{str(e)}"
+            )
+            self.status_label.setText("Area-analysis preview is unavailable. Please go back and check earlier settings.")
+
+        self.update_drawing_buttons()
+        self.redraw_all()
+
+    def get_base_output_names(self) -> List[str]:
+        names = []
+        for name in self.state.get_ordered_names():
+            if name not in names:
+                names.append(name)
+        for name in self.state.get_output_names():
+            if name not in names:
+                names.append(name)
+        return names
+
+    def populate_controls(self):
+        self._updating_controls = True
+        output_names = self.chart_output_names()
+        base_output_names = self.get_base_output_names()
+        aa = self.state.area_analysis_settings
+
+        if aa.base_output_name not in base_output_names:
+            aa.base_output_name = base_output_names[0] if base_output_names else ""
+        if not aa.plot_selection_initialized:
+            if not aa.selected_output_names:aa.selected_output_names = self.chart_element_names()
+            aa.plot_selection_initialized=True
+        ensure_unique_region_colors(aa.regions)
+        aa.enabled = True
+
+        self.base_output_combo.clear()
+        self.base_output_combo.addItems(base_output_names)
+        if aa.base_output_name:
+            self.base_output_combo.setCurrentText(aa.base_output_name)
+
+        self.exclude_masked_checkbox.setChecked(bool(aa.exclude_masked))
+        self.normalize_checkbox.setChecked(bool(aa.normalize_to_100))
+        self.basis_combo.setCurrentIndex(1 if aa.use_processed_values else 0)
+        self.common_checkbox.setChecked(bool(aa.common_pixels))
+        self.error_bars_combo.setCurrentText(aa.error_bars if aa.error_bars in AREA_ERROR_BAR_OPTIONS else "None")
+        self.region_labels_checkbox.setChecked(bool(aa.show_region_labels))
+        self.image_title_edit.setText(aa.image_title or "")
+        self.title_edit.setText(aa.title or "")
+        self.y_label_edit.setText(aa.y_label or "")
+        self.right_y_label_edit.setText(aa.right_y_label or "")
+        self.legend_position_combo.setCurrentText(normalize_line_profile_legend_position(aa.legend_position))
+        self.tick_size_combo.setCurrentText(aa.tick_label_size if aa.tick_label_size in TICK_LABEL_SIZE_OPTIONS else "Default")
+        self.text_size_combo.setCurrentText(aa.text_label_size if aa.text_label_size in TICK_LABEL_SIZE_OPTIONS else "Default")
+
+        self.output_table.blockSignals(True)
+        self.output_table.setRowCount(0)
+        for output_name in output_names:
+            row = self.output_table.rowCount()
+            self.output_table.insertRow(row)
+            output_item = QTableWidgetItem(output_name)
+            output_item.setFlags(output_item.flags() & ~Qt.ItemIsEditable)
+            self.output_table.setItem(row, 0, output_item)
+            use_item = QTableWidgetItem("")
+            use_item.setFlags((use_item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            use_item.setCheckState(Qt.Checked if output_name in aa.selected_output_names else Qt.Unchecked)
+            self.output_table.setItem(row, 1, use_item)
+            unit_item=QTableWidgetItem(self.wizard().engine.area_output_units(output_name)["unit"])
+            unit_item.setFlags(unit_item.flags() & ~Qt.ItemIsEditable)
+            self.output_table.setItem(row,2,unit_item)
+        self.output_table.blockSignals(False)
+
+        self.only_element_combo.clear()
+        self.only_element_combo.addItem("Choose one element…",None)
+        for name in self.chart_element_names():self.only_element_combo.addItem(name,name)
+        self.fill_opacity.setValue(int(aa.region_fill_opacity))
+        self.detail_view_checkbox.setChecked(bool(aa.detail_enabled))
+        self.detail_region_combo.setCurrentText(aa.detail_region_mode)
+        self._common_preference=bool(aa.common_pixels)
+        self.common_checkbox.setChecked(bool(aa.common_pixels or aa.normalize_to_100))
+        self._updating_controls = False
+        self.sync_controls_to_state()
+
+    def load_data_cache(self):
+        self.raw_arrays_cache=self.wizard().engine.load_raw_arrays()
+        self.output_arrays_cache=self.wizard().engine.prepare_area_arrays(self.raw_arrays_cache)
+
+    def base_shape(self) -> Optional[Tuple[int, int]]:
+        array = self.output_arrays_cache.get(self.base_output_combo.currentText().strip())
+        return None if array is None else array.shape
+
+    def base_pixel_size_um(self) -> Optional[float]:
+        try:
+            return self.wizard().engine.get_pixel_size_um_for_output(self.base_output_combo.currentText().strip())
+        except Exception:
+            return None
+
+    def fit_regions_to_background(self):
+        """Validate saved geometry without clipping, moving or discarding any outline."""
+        self._grid_message=""
+        if not self.state.area_analysis_settings.regions:return 0
+        try:
+            signature,_=self.wizard().engine.area_grid_info(self.output_arrays_cache,self.raw_arrays_cache)
+            # Upgrade legacy projects only after verifying their saved cropping/calibration.
+            self.state.area_analysis_settings.grid_signature=signature
+        except ValueError as exc:
+            self._grid_message=str(exc)
+        return 0
+
+    def selected_output_names_from_table(self) -> List[str]:
+        selected = []
+        for row in range(self.output_table.rowCount()):
+            output_item = self.output_table.item(row, 0)
+            use_item = self.output_table.item(row, 1)
+            if output_item is not None and use_item is not None and use_item.checkState() == Qt.Checked:
+                selected.append(output_item.text().strip())
+        return selected
+
+    def sync_controls_to_state(self):
+        if self._updating_controls:
+            return
+        aa = self.state.area_analysis_settings
+        aa.enabled = True
+        aa.base_output_name = self.base_output_combo.currentText().strip()
+        aa.exclude_masked = self.exclude_masked_checkbox.isChecked()
+        aa.normalize_to_100 = self.normalize_checkbox.isChecked()
+        aa.use_processed_values = self.basis_combo.currentIndex() == 1
+        if aa.normalize_to_100:
+            self.common_checkbox.blockSignals(True);self.common_checkbox.setChecked(True);self.common_checkbox.blockSignals(False)
+        elif not self.common_checkbox.isEnabled():
+            self.common_checkbox.blockSignals(True);self.common_checkbox.setChecked(self._common_preference);self.common_checkbox.blockSignals(False)
+        else:self._common_preference=self.common_checkbox.isChecked()
+        aa.common_pixels=self._common_preference
+        self.common_checkbox.setEnabled(not aa.normalize_to_100)
+        aa.region_fill_opacity=self.fill_opacity.value()
+        aa.error_bars = self.error_bars_combo.currentText().strip() or "None"
+        aa.show_region_labels = self.region_labels_checkbox.isChecked()
+        aa.image_title = self.image_title_edit.text().strip()
+        aa.title = self.title_edit.text().strip()
+        aa.y_label = self.y_label_edit.text().strip()
+        aa.right_y_label = self.right_y_label_edit.text().strip()
+        aa.legend_position = normalize_line_profile_legend_position(self.legend_position_combo.currentText())
+        aa.tick_label_size = self.tick_size_combo.currentText().strip() or "Default"
+        aa.text_label_size = self.text_size_combo.currentText().strip() or "Default"
+        aa.selected_output_names = self.selected_output_names_from_table()
+
+    # -- controls --------------------------------------------------------------
+
+    def on_controls_changed(self,*_):
+        if self._updating_controls:return
+        self.cancel_area_interaction()
+        self.sync_controls_to_state()
+        self.output_arrays_cache=self.wizard().engine.prepare_area_arrays(self.raw_arrays_cache)
+        self.redraw_all()
+
+    def on_output_table_changed(self, _item):
+        if self._updating_controls:
+            return
+        self.redraw_all()
+
+    def on_base_output_changed(self,*_):
+        if self._updating_controls:return
+        self.sync_controls_to_state()
+        self._drawing=None;self._edit_drag=None;self._map_view=None
+        self.fit_regions_to_background()
+        self.navigation.update()
+        self.redraw_all()
+        self.status_label.setText(self._grid_message or "Background changed. Existing regions were retained; verify their positions.")
+
+    def on_shape_changed(self,*_):
+        self.activate_drawing()
+
+    def drawing_hint(self) -> str:
+        shape = self.shape_combo.currentText()
+        if shape == "Polygon":
+            return "Polygon: click every corner on the map; double-click, right-click or click the first corner to close it."
+        if shape == "Freehand":
+            return "Freehand: hold the mouse button and draw around the region; release the button to close the outline."
+        return f"{shape}: drag from one corner to the opposite corner, or click the two corners one after the other."
+
+    def update_drawing_buttons(self):
+        drawing = self._drawing
+        self.cancel_button.setEnabled(drawing is not None or self._edit_drag is not None or self._detail_drag is not None)
+        self.finish_button.setEnabled(
+            drawing is not None and drawing["shape"] == "Polygon" and len(drawing["points"]) >= 3
+        )
+        has_regions = bool(self.state.area_analysis_settings.regions) if self.wizard() is not None else False
+        self.clear_regions_button.setEnabled(has_regions)
+        self.delete_region_button.setEnabled(has_regions and self.selected_region_index() is not None)
+
+        self.refresh_area_export_buttons()
+        self.update_interaction_feedback()
+
+    # -- the region table ------------------------------------------------------
+
+    def selected_region_index(self) -> Optional[int]:
+        model = self.region_table.selectionModel()
+        if model is None:
+            return None
+        rows = model.selectedRows()
+        if rows:
+            return rows[0].row()
+        items = self.region_table.selectedItems()
+        return items[0].row() if items else None
+
+    def refresh_region_table(self, select_row: Optional[int] = None):
+        """Show the regions of the state in the table (the cells are updated in place)."""
+        aa = self.state.area_analysis_settings
+        shape = self.base_shape()
+        pixel_size_um = self.base_pixel_size_um()
+        engine = self.wizard().engine
+        was_updating = self._updating_controls
+        self._updating_controls = True
+        self.region_table.blockSignals(True)
+
+        while self.region_table.rowCount() > len(aa.regions):
+            self.region_table.removeRow(self.region_table.rowCount() - 1)
+        while self.region_table.rowCount() < len(aa.regions):
+            self.region_table.insertRow(self.region_table.rowCount())
+
+        for row, region in enumerate(aa.regions):
+            pixels = int(np.count_nonzero(area_region_mask(region, shape))) if shape is not None else 0
+            area_text = ""
+            if pixel_size_um is not None and pixel_size_um > 0:
+                area_text = format_area_um2(pixels * pixel_size_um * pixel_size_um)
+            texts = {
+                self.COL_NAME: region.name,
+                self.COL_SHAPE: normalize_area_shape(region.shape),
+                self.COL_COLOR: engine.resolve_area_region_color(region, row),
+                self.COL_PIXELS: str(pixels),
+                self.COL_AREA: area_text or "no pixel size",
+                self.COL_POINTS: format_area_points(region.points),
+            }
+            for column, text in texts.items():
+                item = self.region_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.region_table.setItem(row, column, item)
+                item.setText(text)
+                if column in (self.COL_SHAPE, self.COL_PIXELS, self.COL_AREA):
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column in (self.COL_PIXELS, self.COL_AREA):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if column == self.COL_POINTS:
+                    item.setToolTip("Pixels, as 'x y; x y': two opposite corners for a rectangle, square or ellipse; every corner for a polygon or freehand outline.")
+
+        for row,region in enumerate(aa.regions):
+            item=QTableWidgetItem("")
+            item.setFlags((item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            item.setCheckState(Qt.Checked if region.region_id in aa.detail_region_ids else Qt.Unchecked)
+            item.setToolTip("Include this complete region in the detail chart; switches to Checked regions mode.")
+            self.region_table.setItem(row,6,item)
+        if select_row is not None and 0 <= select_row < self.region_table.rowCount():
+            self.region_table.selectRow(select_row)
+        elif select_row is not None:
+            self.region_table.clearSelection()
+        self.region_table.blockSignals(False)
+        self._updating_controls = was_updating
+
+    def on_region_selection_changed(self):
+        if self._updating_controls:
+            return
+        if self._edit_drag is not None:self.cancel_area_interaction()
+        self.update_drawing_buttons()
+        self.draw_combined_preview()
+
+    def on_region_item_changed(self, item):
+        if self._updating_controls:
+            return
+        aa = self.state.area_analysis_settings
+        row, column = item.row(), item.column()
+        if not (0 <= row < len(aa.regions)):
+            return
+        before = self.area_edit_snapshot()
+        region = aa.regions[row]
+        text = item.text().strip()
+
+        try:
+            if column == 6:
+                self.on_detail_region_check(item)
+            elif column == self.COL_NAME:
+                if text == "":
+                    raise ValueError("A region needs a name.")
+                if any(i != row and other.name.strip().lower() == text.lower() for i, other in enumerate(aa.regions)):
+                    raise ValueError(f"Another region is already called '{text}'.")
+                region.name = text
+                self.status_label.setText(f"Region renamed to '{text}'.")
+            elif column == self.COL_COLOR:
+                if not is_color_like(text):
+                    raise ValueError(
+                        f"'{text}' is not a valid color. Use names like red, blue, orange, or hex codes like #FF0000."
+                    )
+                color=canonical_region_color(text)
+                if any(i!=row and canonical_region_color(other.color)==color for i,other in enumerate(aa.regions)):
+                    raise ValueError("That colour is already assigned to another region. Choose a unique colour.")
+                region.color = color
+            elif column == self.COL_POINTS:
+                shape = self.base_shape()
+                points = parse_area_points(text)
+                kind = normalize_area_shape(region.shape)
+                if kind in AREA_TWO_POINT_SHAPES and len(points) != 2:
+                    raise ValueError(f"A {kind.lower()} needs exactly two points: two opposite corners.")
+                if kind not in AREA_TWO_POINT_SHAPES and len(points) < 3:
+                    raise ValueError(f"A {kind.lower()} outline needs at least three points.")
+                if shape is not None:
+                    points = clamp_area_points(points, shape)
+                    if kind in ("Square", "Circle"):
+                        x1, y1 = square_second_corner(points[0][0], points[0][1], points[1][0], points[1][1], shape)
+                        points[1] = [round(x1, 2), round(y1, 2)]
+                    candidate = AreaRegion(name=region.name, shape=kind, points=points, color=region.color)
+                    if not np.any(area_region_mask(candidate, shape)):
+                        raise ValueError("These points do not enclose any pixel.")
+                region.points = points
+                self.status_label.setText(f"Outline of '{region.name}' updated.")
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+
+        self.remember_area_edit(before)
+        self.redraw_all(select_row=row)
+
+    def delete_selected_region(self):
+        index=self.selected_region_index()
+        if index is None:return
+        self.cancel_area_interaction()
+        aa=self.state.area_analysis_settings
+        before=self.area_edit_snapshot();name=aa.regions.pop(index).name
+        if not aa.regions:aa.grid_signature={}
+        self.remember_area_edit(before)
+        self.redraw_all(select_row=min(index,len(aa.regions)-1))
+        self.status_label.setText(f"'{name}' deleted. Undo restores it.")
+
+    def clear_regions(self):
+        before=self.area_edit_snapshot()
+        aa=self.state.area_analysis_settings;aa.regions=[];aa.grid_signature={}
+        self._drawing=None;self._edit_drag=None
+        self.remember_area_edit(before)
+        self.redraw_all(select_row=-1)
+        self.status_label.setText("All regions cleared. Undo restores them.")
+
+    # -- drawing with the mouse ------------------------------------------------
+
+    def clamp_point_to_base_array(self, x: float, y: float) -> Tuple[float, float]:
+        shape = self.base_shape()
+        if shape is None:
+            return float(x), float(y)
+        rows, cols = shape
+        return float(np.clip(x, 0, cols - 1)), float(np.clip(y, 0, rows - 1))
+
+    def event_point(self,event):
+        axis=self._interaction_ax if self._interaction_ax is not None else self.map_axes_for_event(event)
+        if axis is None or event.x is None or event.y is None:return None
+        point=axis.transData.inverted().transform((event.x,event.y))
+        if not np.isfinite(point).all():return None
+        return self.clamp_point_to_base_array(*point)
+
+    def on_mouse_press(self, event):
+        self.clear_region_hover()
+        axis=self.map_axes_for_event(event)
+        if axis is None or self.base_shape() is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._interaction_ax=axis
+        if self.detail_box_button.isChecked() and self.state.area_analysis_settings.detail_enabled:
+            if axis is self.map_ax and event.button==1:self.detail_box_press(event)
+            return
+        if self.navigation.mode or self.detail_navigation.mode:
+            return
+        if self.edit_checkbox.isChecked():
+            if event.button == 1:
+                self.handle_area_edit_press(event)
+            return
+        shape = self.shape_combo.currentText()
+        drawing = self._drawing
+
+        if event.button == 3:                                   # right-click: close a polygon, or cancel
+            if drawing is not None and drawing["shape"] == "Polygon":
+                self.finish_polygon()
+            elif drawing is not None:
+                self.cancel_drawing()
+            return
+        if event.button != 1:
+            return
+
+        point = list(self.clamp_point_to_base_array(event.xdata, event.ydata))
+
+        if shape == "Polygon":
+            if drawing is None or drawing["shape"] != "Polygon":
+                self._drawing = {"shape": "Polygon", "points": [point], "cursor": tuple(point)}
+                self.status_label.setText("First corner set. Click the next corners; double-click or right-click to close the polygon.")
+            elif event.dblclick:
+                self.finish_polygon()
+                return
+            else:
+                first_x, first_y = axis.transData.transform(drawing["points"][0])
+                near_first = np.hypot(event.x - first_x, event.y - first_y) <= self.CLOSE_DISTANCE_PX
+                if near_first and len(drawing["points"]) >= 3:
+                    self.finish_polygon()
+                    return
+                drawing["points"].append(point)
+                drawing["cursor"] = tuple(point)
+                self.status_label.setText(
+                    f"{len(drawing['points'])} corners. Double-click, right-click or click the first corner to close the polygon."
+                )
+        elif shape == "Freehand":
+            self._drawing = {"shape": "Freehand", "points": [point], "cursor": tuple(point), "dragging": True}
+        else:
+            if drawing is not None and drawing["shape"] == shape and drawing.get("click_mode"):
+                self.finish_two_point_shape(point)              # the second click
+                return
+            self._drawing = {
+                "shape": shape, "points": [point], "cursor": tuple(point), "dragging": True,
+                "click_mode": False, "press_xy": (event.x, event.y),
+            }
+
+        self.update_drawing_buttons()
+        self.refresh_preview_artists()
+
+    def on_mouse_move(self, event):
+        self.update_region_hover(event)
+        if self._detail_drag is not None:
+            self.detail_box_move(event);return
+        if self.active_map_navigation().mode:
+            self.cancel_area_interaction();return
+        if self._edit_drag is not None:
+            self.handle_area_edit_move(event)
+            return
+        drawing = self._drawing
+        if drawing is None:
+            return
+        point = self.event_point(event)
+        if point is None:
+            return
+        shape = drawing["shape"]
+        if shape == "Freehand":
+            if not drawing.get("dragging"):
+                return
+            last_x, last_y = drawing["points"][-1]
+            if np.hypot(point[0] - last_x, point[1] - last_y) >= 0.75 and len(drawing["points"]) < 20000:
+                drawing["points"].append([point[0], point[1]])
+        elif shape == "Polygon":
+            drawing["cursor"] = point
+        else:
+            if not (drawing.get("dragging") or drawing.get("click_mode")):
+                return
+            drawing["cursor"] = point
+        self.refresh_preview_artists()
+
+    def on_mouse_release(self, event):
+        if self._detail_drag is not None:
+            self.detail_box_release(event);return
+        if self.active_map_navigation().mode:
+            self.cancel_area_interaction();return
+        if self._edit_drag is not None and event.button == 1:
+            self.handle_area_edit_release()
+            return
+        drawing = self._drawing
+        if drawing is None or event.button != 1 or not drawing.get("dragging"):
+            return
+        shape = drawing["shape"]
+        point = self.event_point(event)
+
+        if shape == "Freehand":
+            if point is not None:
+                drawing["points"].append([point[0], point[1]])
+            self.finish_region("Freehand", drawing["points"])
+            return
+
+        press_x, press_y = drawing.get("press_xy", (event.x, event.y))
+        moved = np.hypot((event.x or press_x) - press_x, (event.y or press_y) - press_y)
+        if moved < self.CLICK_DISTANCE_PX:
+            # A click without a drag: wait for a second click on the opposite corner.
+            drawing["dragging"] = False
+            drawing["click_mode"] = True
+            self.status_label.setText("First corner set. Move the mouse and click the opposite corner.")
+            self.update_drawing_buttons()
+            self.refresh_preview_artists()
+            return
+        self.finish_two_point_shape(list(point) if point is not None else list(drawing["cursor"]))
+
+    def finish_two_point_shape(self, second_point):
+        drawing = self._drawing
+        if drawing is None:
+            return
+        shape = drawing["shape"]
+        first = drawing["points"][0]
+        second = [float(second_point[0]), float(second_point[1])]
+        if shape in ("Square", "Circle"):
+            second = list(square_second_corner(first[0], first[1], second[0], second[1], self.base_shape()))
+        self.finish_region(shape, [first, second])
+
+    def finish_polygon(self):
+        drawing = self._drawing
+        if drawing is None or drawing["shape"] != "Polygon":
+            return
+        if len(drawing["points"]) < 3:
+            self.status_label.setText("A polygon needs at least three corners. Click more corners, or cancel the shape.")
+            return
+        self.finish_region("Polygon", drawing["points"])
+
+    def cancel_drawing(self):
+        self._detail_drag=None
+        self.cancel_area_interaction();self.update_drawing_buttons();self.refresh_preview_artists()
+        self.status_label.setText("Drawing/edit cancelled. "+self.drawing_hint())
+
+    def finish_region(self,shape,points):
+        aa=self.state.area_analysis_settings
+        base_shape=self.base_shape()
+        self._drawing=None
+        if base_shape is None:return
+        if shape=="Freehand":points=simplify_area_path(points)
+        region=AreaRegion(name=unique_area_region_name([r.name for r in aa.regions]),shape=shape,
+            points=clamp_area_points(points,base_shape),
+            color=next_area_region_color([self.wizard().engine.resolve_area_region_color(r,i) for i,r in enumerate(aa.regions)]))
+        if not area_region_is_complete(region) or not area_region_mask(region,base_shape).any():
+            self.status_label.setText("That shape has no area or contains no pixel centres. Draw it again.")
+            self.update_drawing_buttons();self.refresh_preview_artists();return
+        try:
+            signature,_=self.wizard().engine.area_grid_info(self.output_arrays_cache,self.raw_arrays_cache)
+        except ValueError as exc:
+            self.status_label.setText(str(exc));self.update_drawing_buttons();self.refresh_preview_artists();return
+        before=self.area_edit_snapshot()
+        aa.grid_signature=signature;aa.regions.append(region)
+        if aa.detail_enabled and aa.detail_region_mode=="Checked regions" and self._interaction_ax is self.detail_map_ax:
+            aa.detail_region_ids.append(region.region_id)
+        self.remember_area_edit(before)
+        self.redraw_all(select_row=len(aa.regions)-1)
+        self.status_label.setText(f"'{region.name}' added. Rename it in Regions, or draw another area.")
+
+    def clear_preview_artists(self):
+        for artist in self._preview_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._preview_artists = []
+
+    def add_preview_artists(self):
+        for axis in [self.map_ax]+([self.detail_map_ax] if self.state.area_analysis_settings.detail_enabled else []):
+            if axis is None:continue
+            if self.edit_checkbox.isChecked():
+                index=self.selected_region_index()
+                if index is None or index>=len(self.state.area_analysis_settings.regions):continue
+                region=self._edit_drag["candidate"] if self._edit_drag is not None else self.state.area_analysis_settings.regions[index]
+                outline=area_region_outline(region);points=area_points_array(region.points)
+                self._preview_artists.extend(axis.plot(outline[:,0],outline[:,1],color="white",linestyle="--",linewidth=1.3,
+                    zorder=45,scalex=False,scaley=False))
+                self._preview_artists.extend(axis.plot(points[:,0],points[:,1],linestyle="none",marker="o",markersize=4,
+                    markerfacecolor="white",markeredgecolor="black",zorder=46,scalex=False,scaley=False))
+                continue
+            drawing=self._drawing
+            if drawing is None:continue
+            points=copy.deepcopy(drawing["points"]);cursor=drawing.get("cursor");shape=drawing["shape"]
+            if shape in AREA_TWO_POINT_SHAPES:
+                if cursor is None:continue
+                second=list(cursor)
+                if shape in ("Square","Circle"):second=list(square_second_corner(*points[0],*second,self.base_shape()))
+                outline=area_region_outline(AreaRegion(shape=shape,points=[points[0],second]))
+            else:outline=np.array(points+([points[0]] if shape=="Freehand" and len(points)>2 else [list(cursor)] if cursor is not None else []))
+            if len(outline)>=2:
+                self._preview_artists.extend(axis.plot(outline[:,0],outline[:,1],color="white",linestyle="--",linewidth=1.6,
+                    zorder=40,scalex=False,scaley=False,path_effects=[patheffects.withStroke(linewidth=3.2,foreground="black")]))
+            if shape!="Freehand" and points:
+                self._preview_artists.extend(axis.plot([p[0] for p in points],[p[1] for p in points],linestyle="none",marker="o",
+                    markersize=4,markerfacecolor="white",markeredgecolor="black",zorder=41,scalex=False,scaley=False))
+
+    def refresh_preview_artists(self):
+        self.clear_preview_artists();self.add_preview_artists();self.combined_canvas.draw_idle()
+        if self.state.area_analysis_settings.detail_enabled:self.detail_canvas.draw_idle()
+
+    # -- results and preview ---------------------------------------------------
+
+    def compute_result(self):
+        self._last_result = None
+        self._result_message = ""
+        aa = self.state.area_analysis_settings
+        if not self.output_arrays_cache:
+            self._result_message = "No data available"
+            return
+        if not aa.regions:
+            self._result_message = "Draw a region on the map"
+            return
+        if not aa.selected_output_names:
+            self._result_message = "Select at least one output in the Outputs tab"
+            return
+        try:
+            self._last_result = self.wizard().engine.compute_area_analysis(
+                self.output_arrays_cache, self.raw_arrays_cache
+            )
+        except Exception as e:
+            self._result_message = str(e)
+
+    @staticmethod
+    def format_result_cell(entry):
+        def number(v,digits=4):return "n/a" if v is None else f"{v:.{digits}g}"
+        spread=number(entry["sd"],3)
+        mean=f"{number(entry['mean'])} ± {spread}"
+        if entry["value_kind"]=="ratio of means":
+            text=number(entry["value"])
+            first=f"Ratio of means: {text}; {entry['ratio_pixels_used']} paired pixels.\nMean of pixel ratios: {mean}; {entry['pixels_used']} finite pixel ratios."
+        elif entry["value_kind"]=="normalised mean":
+            text=f"{number(entry['value'])}%  ({mean})"
+            first="Relative composition of the selected elements. Parentheses: original mean ± sample SD."
+        else:
+            text=mean if entry["mean"] is not None else "no values"
+            first="Mean ± sample SD (spatial variation). SD is n/a for fewer than two pixels."
+        tip=(f"{first}\nUnit: {entry['unit']}. Display uses {entry['display_pixels_used']} pixels.\n"
+             f"{entry['pixels_masked']} masked; {entry['pixels_empty']} non-finite on the chosen common/input basis; "
+             f"{entry['pixels_undefined']} additional undefined pixel ratios/values.\n"
+             f"median {number(entry['median'])}, minimum {number(entry['min'])}, maximum {number(entry['max'])}")
+        return text,tip
+
+    def refresh_results_table(self):
+        result = self._last_result
+        table = self.results_table
+        table.clear()
+        if result is None:
+            table.setRowCount(0)
+            table.setColumnCount(0)
+            self.results_hint.setText(self._result_message or "Draw a region on the map")
+            self.copy_results_button.setEnabled(False)
+            return
+
+        regions = result["regions"]
+        names = result["selected_output_names"]
+        table.setColumnCount(len(regions))
+        table.setHorizontalHeaderLabels([region["name"] for region in regions])
+        row_labels = ["Pixels in region", "Selected area", "Common pixels used", "Common area used"] + [f"{n} ({result['units'][n]['unit']})" for n in names]
+        table.setRowCount(len(row_labels))
+        table.setVerticalHeaderLabels(row_labels)
+        for column, region in enumerate(regions):
+            cells = [(str(region["pixels"]), ""), (format_area_um2(region["area_um2"]) or "no pixel size", ""),
+                     (str(region["common_pixels_used"]) if region["common_pixels_used"] is not None else "per output", "See each cell tooltip for the count used by the displayed statistic."),
+                     (format_area_um2(region["common_area_um2"]) or "n/a", "")]
+            cells += [self.format_result_cell(region["stats"][name]) for name in names]
+            for row, (text, tip) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if tip:
+                    item.setToolTip(tip)
+                table.setItem(row, column, item)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        notes = ["Mean ± standard deviation of the pixel values in each region."]
+        if any(entry.get("value_kind") == "ratio of means" for region in regions for entry in region["stats"].values()):
+            notes.append("Ratios: ratio of the region means.")
+        if result["normalization_names"]:
+            notes.append("Normalised to 100 over " + ", ".join(result["normalization_names"]) + ".")
+        if result["exclude_masked"] and result["masking_active"]:
+            notes.append("Masked pixels are left out.")
+        notes.append(result["data_basis"] + ".")
+        notes.append("Shared valid pixels." if result["common_pixels"] else "Valid pixels are counted per output.")
+        notes.extend(meta["warning"] for meta in result["units"].values() if meta["warning"])
+        notes.append("SD describes spatial variation; n/a for fewer than two pixels.")
+        self.results_hint.setText(" ".join(notes))
+        self.copy_results_button.setEnabled(True)
+
+    def results_as_text(self):
+        result=self._last_result
+        if result is None:return ""
+        # Paste the same explicit statistics and provenance as the CSV, with counts for both ratio summaries.
+        header=["Region","Output","Input unit","Displayed unit","Displayed value","Display kind","Display pixels","Mean","SD",
+                "Pixel-statistics pixels","Ratio of means","Paired pixels","Relative %","Selected area (µm²)",
+                "Used area (µm²)","Data basis","Common pixels","Exclude masked pixels"]
+        lines=[header]
+        for r in result["regions"]:
+            for name in result["selected_output_names"]:
+                e=r["stats"][name]
+                lines.append([r["name"],name,e["unit"],e["display_unit"],e["value"],e["value_kind"],e["display_pixels_used"],e["mean"],e["sd"],
+                    e["pixels_used"],e["ratio_of_means"],e["ratio_pixels_used"],e["normalized"],r["area_um2"],e["display_area_um2"],
+                    result["data_basis"],result["common_pixels"],result["exclude_masked"]])
+        return "\n".join("\t".join(str(area_csv_cell(v)) for v in row) for row in lines)
+
+    def copy_results(self):
+        text = self.results_as_text()
+        if not text:
+            self.status_label.setText("There are no results to copy yet.")
+            return
+        QGuiApplication.clipboard().setText(text)
+        self.status_label.setText("Results copied. Paste them into a spreadsheet.")
+
+    def draw_combined_preview(self):
+        self.clear_region_hover()
+        base = self.base_output_combo.currentText()
+        key = (base, self.base_shape())
+        if self._has_area_view and self._view_key == key and self.map_ax is not None:
+            self._map_view = (self.map_ax.get_xlim(), self.map_ax.get_ylim())
+        elif self._view_key != key:
+            self._map_view = None
+        self._view_key = key
+        if self.map_ax is not None and self.map_ax in self.combined_figure.axes:
+            for axis in list(self.combined_figure.axes):
+                if axis is not self.map_ax:axis.remove()
+            self.map_ax.clear()
+        else:self.map_ax=None
+        self._preview_artists = []
+        aa = self.state.area_analysis_settings
+        engine = self.wizard().engine
+        legend_outside = normalize_line_profile_legend_position(aa.legend_position) == "Outside right"
+
+        # The map gets most of the room, because the regions are drawn on it; the chart is as tall as the map.
+        panel_y = max(0.17, min(0.27, 54.0 / max(self.combined_canvas.height(), 1)))
+        panel_h = 0.88 - panel_y
+        map_x = 0.105
+        map_w = 0.36 if legend_outside else 0.44
+        chart_x = 0.565 if legend_outside else 0.665
+        chart_w = 0.20 if legend_outside else 0.24
+        if self.map_ax is None:self.map_ax = self.combined_figure.add_axes([map_x, panel_y, map_w, panel_h])
+        else:self.map_ax.set_position([map_x,panel_y,map_w,panel_h])
+        self.chart_ax = self.combined_figure.add_axes([chart_x, panel_y, chart_w, panel_h])
+        cax = self.combined_figure.add_axes([map_x - 0.022, panel_y, 0.012, panel_h])
+
+        base_name = self.base_output_combo.currentText().strip()
+        if base_name == "" or base_name not in self.output_arrays_cache:
+            self.map_ax.text(0.5, 0.5, "No output available", ha="center", va="center")
+            self.map_ax.set_axis_off()
+            self.chart_ax.set_axis_off()
+            cax.set_axis_off()
+            self.combined_canvas.draw_idle()
+            return
+
+        try:
+            engine.plot_area_analysis_map_axis(
+                self.map_ax,
+                cax,
+                self.output_arrays_cache,
+                self.raw_arrays_cache,
+                selected_index=self.selected_region_index(),
+                pixel_size_um=self.base_pixel_size_um(),
+            )
+        except Exception as e:
+            self.map_ax.text(0.5, 0.5, str(e), ha="center", va="center", wrap=True)
+            self.map_ax.set_axis_off()
+
+        if self._last_result is not None:
+            try:
+                engine.plot_area_analysis_axis(self.chart_ax, self._last_result)
+            except Exception as e:
+                self.chart_ax.text(0.5, 0.5, str(e), ha="center", va="center", wrap=True)
+                self.chart_ax.set_axis_off()
+        else:
+            self.chart_ax.text(0.5, 0.5, self._result_message or "Draw a region on the map", ha="center", va="center", wrap=True)
+            self.chart_ax.set_axis_off()
+
+        try:
+            self.combined_figure.canvas.draw()
+            map_pos = self.map_ax.get_position()
+            chart_pos = self.chart_ax.get_position()
+            cax.set_position([map_pos.x0 - 0.022, map_pos.y0, 0.012, map_pos.height])
+            new_chart_position = [chart_pos.x0, map_pos.y0, chart_pos.width, map_pos.height]
+            self.chart_ax.set_position(new_chart_position)
+            right_chart_ax = getattr(self.chart_ax, "_elementti_right_axis", None)
+            if right_chart_ax is not None:
+                right_chart_ax.set_position(new_chart_position)
+            fit_area_chart_legend(self.chart_ax)
+        except Exception:
+            pass
+
+        if self.state.area_analysis_settings.detail_enabled:
+            rows,cols=self.base_shape()
+            self.map_ax.set_xlim(-.5,cols-.5);self.map_ax.set_ylim(rows-.5,-.5)
+            if not self.state.area_analysis_settings.image_title:self.map_ax.set_title("Overview",fontsize=10)
+        elif self._map_view is not None:
+            self.map_ax.set_xlim(self._map_view[0])
+            self.map_ax.set_ylim(self._map_view[1])
+        self._has_area_view = True
+        if self.navigation._nav_stack() is None:self.navigation.push_current()
+        self.add_preview_artists()
+        self.refresh_area_export_buttons()
+        self.draw_detail_window()
+        self.draw_detail_panel()
+        self.combined_canvas.draw_idle()
+
+    def redraw_all(self, select_row: Optional[int] = None):
+        """Recalculate the region values and show them. `select_row` chooses the highlighted region
+        (-1 for none); by default the selection is kept."""
+        self.sync_controls_to_state()
+        self.compute_result()
+        if select_row is None:
+            select_row = self.selected_region_index()
+            if select_row is None:
+                select_row = -1
+        self.refresh_region_table(select_row=select_row)
+        self.refresh_results_table()
+        self.update_drawing_buttons()
+        self.draw_combined_preview()
+
+    # -- leaving the page ------------------------------------------------------
+
+    def validatePage(self):
+        if self._detail_nav_timer.isActive():
+            self._detail_nav_timer.stop();self.sync_detail_navigation()
+        self.sync_controls_to_state()
+        aa = self.state.area_analysis_settings
+        if not aa.enabled:
+            return True
+
+        if self._drawing is not None or self._edit_drag is not None or self._detail_drag is not None:
+            QMessageBox.warning(
+                self,
+                "Shape not finished",
+                "A shape is still being drawn. Finish it (for a polygon: double-click or 'Close polygon'), or click 'Cancel shape'."
+            )
+            return False
+
+        if True:
+            try:
+                self.load_data_cache()
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Area-analysis data unavailable",
+                    f"The app could not prepare the area-analysis data.\n\n{str(e)}"
+                )
+                return False
+
+        if not aa.base_output_name:
+            QMessageBox.warning(self, "Missing background output", "Please choose a background output for the area analysis.")
+            return False
+
+        if not aa.selected_output_names:
+            QMessageBox.warning(self, "No outputs selected", "Please select at least one output in the Outputs tab.")
+            return False
+
+        if not aa.regions:
+            QMessageBox.warning(self, "No region", "Please draw at least one region on the map, or choose 'No' for area analysis.")
+            return False
+
+        seen = set()
+        for region in aa.regions:
+            key = region.name.strip().lower()
+            if key == "" or key in seen:
+                QMessageBox.warning(self, "Region names", "Every region needs its own name. Please rename the regions in the Regions tab.")
+                return False
+            seen.add(key)
+            if region.color.strip() and not is_color_like(region.color.strip()):
+                QMessageBox.warning(self, "Invalid outline color", f"'{region.color}' is not a valid color for '{region.name}'.")
+                return False
+
+        try:
+            self.wizard().engine.compute_area_analysis(self.output_arrays_cache, self.raw_arrays_cache)
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid area analysis", str(e))
+            return False
+
+        return True
+
+
 class GeneratePage(QWizardPage):
     def __init__(self):
         super().__init__()
-        self.setTitle(step_title(8, "Generate"))
+        self.setTitle(step_title(9, "Generate"))
         self.setSubTitle("Save outputs.")
 
         layout = QVBoxLayout()
@@ -8486,7 +13824,8 @@ class GeneratePage(QWizardPage):
             "Generate/export help",
             "Use this page to choose where Elementti will save the results from the current run. Select an output folder and optionally enter a project name. If a project name is provided, it is added to the beginning of exported file names.\n\n"
             "You can save figure files, processed CSV files, or both. Figure files use the selected format and DPI. Processed CSV files contain the numerical arrays after scaling and active numerical processing rules. Ratio and formula CSV files contain the calculated values, with non-finite values stored as NaN.\n\n"
-            "Elementti also saves two more files. Detailed explanations.docx (Word) explains every step of the run in words, formulas and tables, with what each rule changed, and ends with a description of the run that can be adapted for the methods section of a paper. Project.elementti.json is the project file: it records every setting, and 'Open project' in step 1 reads it back to make the same outputs again or to use the same settings with new maps.\n\n"
+            "When a line profile or an area analysis was made, its figures and CSV files are saved as well.\n\n"
+            "Tick Save Word report to include Detailed explanations.docx with embedded maps and charts. Untick it to skip Word. The Word report explains every step of the run in words, formulas and tables, with what each rule changed, and ends with a description of the run that can be adapted for the methods section of a paper. Project.elementti.json is the project file: it records every setting, and 'Open project' in step 1 reads it back to make the same outputs again or to use the same settings with new maps.\n\n"
             "After clicking Generate, the app saves the outputs and remains open, so you can go back, change settings, and generate another set of outputs."
         )
 
@@ -8519,6 +13858,11 @@ class GeneratePage(QWizardPage):
 
         layout.addWidget(self.save_png_checkbox)
         layout.addWidget(self.save_csv_checkbox)
+        self.save_word_checkbox = QCheckBox("Save Word report (.docx)")
+        self.save_word_checkbox.setChecked(True)
+        self.save_word_checkbox.setToolTip("Include detailed explanations, maps and charts in a Word report. Uncheck to skip Word.")
+        self.save_word_checkbox.stateChanged.connect(self.on_save_options_changed)
+        layout.addWidget(self.save_word_checkbox)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Figure format:"))
@@ -8570,12 +13914,17 @@ class GeneratePage(QWizardPage):
         return self.wizard().state
 
     def initializePage(self):
-        self.output_folder_edit.setText(self.state.output_folder)
-        self.project_name_edit.setText(self.state.project_name)
-        self.save_png_checkbox.setChecked(self.state.save_png)
-        self.save_csv_checkbox.setChecked(self.state.save_csv)
-        self.figure_format_combo.setCurrentText(self.state.figure_format)
-        self.dpi_edit.setText(str(self.state.figure_dpi))
+        self._initializing = True
+        try:
+            self.output_folder_edit.setText(self.state.output_folder)
+            self.project_name_edit.setText(self.state.project_name)
+            self.save_png_checkbox.setChecked(self.state.save_png)
+            self.save_csv_checkbox.setChecked(self.state.save_csv)
+            self.save_word_checkbox.setChecked(self.state.save_word)
+            self.figure_format_combo.setCurrentText(self.state.figure_format)
+            self.dpi_edit.setText(str(self.state.figure_dpi))
+        finally:
+            self._initializing = False
         self.sync_to_state()
         self.update_summary()
 
@@ -8587,10 +13936,12 @@ class GeneratePage(QWizardPage):
         self.copy_citation_button.setText("Copied")
 
     def sync_to_state(self):
+        if getattr(self, "_initializing", False) or self.wizard() is None:return
         self.state.output_folder = self.output_folder_edit.text().strip()
         self.state.project_name = self.project_name_edit.text().strip()
         self.state.save_png = self.save_png_checkbox.isChecked()
         self.state.save_csv = self.save_csv_checkbox.isChecked()
+        self.state.save_word = self.save_word_checkbox.isChecked()
         self.state.figure_format = self.figure_format_combo.currentText().strip()
 
         dpi_text = self.dpi_edit.text().strip()
@@ -8636,11 +13987,11 @@ class GeneratePage(QWizardPage):
             QMessageBox.warning(self, "Missing output folder", "Please choose an output folder.")
             return False
 
-        if not self.state.save_png and not self.state.save_csv:
+        if not self.state.save_png and not self.state.save_csv and not self.state.save_word:
             QMessageBox.warning(
                 self,
                 "Nothing to save",
-                "Please select at least one output type: figure files and/or processed CSV files."
+                "Please select at least one output type: figure files, processed CSV files or a Word report."
             )
             return False
 
@@ -8676,10 +14027,13 @@ class GeneratePage(QWizardPage):
         folder = self.output_folder_edit.text().strip()
         fig_text = "Yes" if self.save_png_checkbox.isChecked() else "No"
         csv_text = "Yes" if self.save_csv_checkbox.isChecked() else "No"
+        word_text = "Yes" if self.save_word_checkbox.isChecked() else "No"
         fmt = self.figure_format_combo.currentText().strip()
         dpi = self.dpi_edit.text().strip() or "(not set yet)"
         masking_text = "Yes" if self.state.masking_and_noise_settings.enabled else "No"
         line_profile_text = "Yes" if self.state.line_profile_settings.enabled else "No"
+        area_settings = self.state.area_analysis_settings
+        area_analysis_text = f"Yes ({len(area_settings.regions)} regions)" if area_settings.enabled else "No"
 
         self.summary_label.setText(
             f"Summary:\n"
@@ -8688,12 +14042,14 @@ class GeneratePage(QWizardPage):
             f"- Selected formulas: {len(self.state.selected_formulas)}\n"
             f"- Masking and noise removal enabled: {masking_text}\n"
             f"- Line profile enabled: {line_profile_text}\n"
+            f"- Area analysis enabled: {area_analysis_text}\n"
             f"- Save figure files: {fig_text}\n"
             f"- Save processed CSV files: {csv_text}\n"
+            f"- Save Word report with figures: {word_text}\n"
             f"- Figure format: {fmt}\n"
             f"- DPI: {dpi}\n"
             f"- Output folder: {folder if folder else '(not chosen yet)'}\n"
-            f"- Also saved: Detailed explanations.docx and the project file Project.elementti.json"
+            f"- Project file: Project.elementti.json"
         )
 
 
@@ -8708,7 +14064,9 @@ class ElementtiWizard(QWizard):
     PAGE_DISPLAY = 7
     PAGE_LINE_PROFILE_INTRO = 8
     PAGE_LINE_PROFILE = 9
-    PAGE_GENERATE = 10
+    PAGE_AREA_ANALYSIS_INTRO = 10
+    PAGE_AREA_ANALYSIS = 11
+    PAGE_GENERATE = 12
 
     def __init__(self):
         super().__init__()
@@ -8717,6 +14075,7 @@ class ElementtiWizard(QWizard):
         self.engine = ProcessingEngine(self.state)
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.setStyleSheet(INTERACTION_STYLE)
         self.setWizardStyle(QWizard.ModernStyle)
 
         self.setWindowFlags(
@@ -8738,6 +14097,8 @@ class ElementtiWizard(QWizard):
         self.setPage(self.PAGE_DISPLAY, DisplaySettingsPage())
         self.setPage(self.PAGE_LINE_PROFILE_INTRO, LineProfileIntroPage())
         self.setPage(self.PAGE_LINE_PROFILE, LineProfilePage())
+        self.setPage(self.PAGE_AREA_ANALYSIS_INTRO, AreaAnalysisIntroPage())
+        self.setPage(self.PAGE_AREA_ANALYSIS, AreaAnalysisPage())
         self.setPage(self.PAGE_GENERATE, GeneratePage())
 
         self.setStartId(self.PAGE_WELCOME)
@@ -8764,14 +14125,15 @@ class ElementtiWizard(QWizard):
         self.setButtonText(QWizard.FinishButton, "Generate")
         self.setButtonText(QWizard.CancelButton, "Close")
 
-    # Steps: the page shown for each of the eight steps, and the step of each page.
+    # Steps: the page shown for each of the nine steps, and the step of each page.
     @property
     def step_pages(self):
         return {1: self.PAGE_UPLOAD, 2: self.PAGE_RENAME, 3: self.PAGE_OUTPUTS, 4: self.PAGE_PROCESSING,
-                5: self.PAGE_MASKING_INTRO, 6: self.PAGE_DISPLAY, 7: self.PAGE_LINE_PROFILE_INTRO, 8: self.PAGE_GENERATE}
+                5: self.PAGE_MASKING_INTRO, 6: self.PAGE_DISPLAY, 7: self.PAGE_LINE_PROFILE_INTRO,
+                8: self.PAGE_AREA_ANALYSIS_INTRO, 9: self.PAGE_GENERATE}
 
     def step_of_page(self, page_id: int) -> int:
-        extra = {self.PAGE_MASKING_SETTINGS: 5, self.PAGE_LINE_PROFILE: 7}
+        extra = {self.PAGE_MASKING_SETTINGS: 5, self.PAGE_LINE_PROFILE: 7, self.PAGE_AREA_ANALYSIS: 8}
         if page_id in extra:
             return extra[page_id]
         return next((n for n, p in self.step_pages.items() if p == page_id), 0)
@@ -8785,6 +14147,8 @@ class ElementtiWizard(QWizard):
             skipped.add(5)
         if step > 7 and not self.state.line_profile_settings.enabled:
             skipped.add(7)
+        if step > 8 and not self.state.area_analysis_settings.enabled:
+            skipped.add(8)
         self.steps.show_state(step, skipped)
 
     def go_to_step(self, number: int):
@@ -8798,7 +14162,7 @@ class ElementtiWizard(QWizard):
     def set_state(self, state: AppState):
         """Use another set of settings (an opened project)."""
         self.state = state
-        self.engine.state = state
+        self.engine = ProcessingEngine(state)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -8869,7 +14233,7 @@ class ElementtiWizard(QWizard):
             "The outputs were saved in this folder:",
             os.path.abspath(self.state.output_folder),
             "",
-            f"Detailed explanations: {os.path.basename(report_path)}",
+            *([f"Word report: {os.path.basename(report_path)}"] if report_path else []),
             f"Project file: {os.path.basename(project_path)} (open it later with 'Open project' in step 1)",
         ]
         if self.state.save_png:
@@ -8880,6 +14244,8 @@ class ElementtiWizard(QWizard):
             msg_lines.append("Masking and noise-removal settings were applied.")
         if self.state.line_profile_settings.enabled:
             msg_lines.append("Line-profile outputs were saved according to the selected save options.")
+        if self.state.area_analysis_settings.enabled:
+            msg_lines.append("Area-analysis outputs were saved according to the selected save options.")
         msg_lines += ["", "Elementti stays open, so you can go back, change settings and generate again."]
 
         if ui.ask(self, "Finished", "\n".join(msg_lines), yes="Open the folder", no="Close", default_yes=True):
@@ -8898,7 +14264,7 @@ def set_windows_app_user_model_id() -> None:
 
 
 def check_demo_cli() -> int:
-    """`python Elementti_1_1_0.py --check-demo`: make the demo outputs in a temporary folder, without a window."""
+    """`python Elementti_1_1_1.py --check-demo`: make the demo outputs in a temporary folder, without a window."""
     import matplotlib.pyplot as _plt
     _plt.switch_backend("Agg")
     with tempfile.TemporaryDirectory(prefix="elementti_check_") as tmp:
