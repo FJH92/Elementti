@@ -40,3 +40,8 @@ Thumbs.db
 output/
 *.json
 methods_Elementti.txt
+
+# Elementti outputs and builds
+*.docx
+~$*.docx
+*.exe

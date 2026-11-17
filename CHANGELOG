@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.1.0
+
+Post-publication feature update of Elementti. The minor version number is raised because this release adds new functionality and changes which record files are saved with the outputs.
+
+### Added
+
+* **Projects.** Every time **Generate** is clicked, Elementti saves a project file, `Project.elementti.json`, that records every setting of every step.
+* **Open project** button in step 1 that reads a saved project back with all its settings:
+  * **Its own map files** makes the same outputs again. If the map files were moved, Elementti asks for the folder that contains them.
+  * **Other map files** uses the same settings with new maps, for example another sample measured the same way. Files with identical names are matched automatically, and every other map is chosen in a matching dialog.
+* **Detailed explanations.docx.** A Word document saved with the outputs that explains every step of the run in words, formulas, and tables, including what each rule changed. It ends with a description of the run that can be adapted for the methods section of a paper. It is written with the Python standard library only, so Microsoft Word is not needed to create it.
+* **How it works** windows for preprocessing, ratio and formula maps, grayscale masking, low-value protection, conditional rules, colour scales, scale bars, and line profiles. Each one explains the method in full, with its formula and a worked example.
+* **Step list** on the left of the window that shows the eight steps (Files, Names, Outputs, Preprocessing, Masking and noise, Display, Line profile, Generate). Finished steps can be clicked to go back. Page titles now read "Step N of 8".
+* **Progress window** while outputs are generated, so Elementti stays responsive during long runs.
+* **Create Elementti.exe** button on the welcome page, available when Elementti is run from the `.py` file. It builds a single program file that starts without Python. PyInstaller is installed automatically the first time, which needs an internet connection once. On Windows, the program is signed automatically if a code-signing certificate is installed; otherwise it is left unsigned.
+* Command-line options:
+  * `--make-exe [folder]` builds `Elementti.exe` from the console and prints progress.
+  * `--check-demo` makes the demo outputs in a temporary folder without opening a window, as a quick installation check.
+* **Copy citation** button on the final page.
+
+### Changed
+
+* The logo and the Windows icon are built into the source file, so the single `.py` file is all that is needed. The separate `icoElementti_*.ico` and `pngElementti_*.png` resource files are no longer required.
+* The JSON summary file and the plain-text methods file are replaced by `Project.elementti.json` and `Detailed explanations.docx`, which contain the same information and more.
+* Message boxes use buttons that say what they do.
+* Help texts were updated to describe projects, the new record files, and the new windows.
+
 ## v1.0.9
 
 Post-publication update of Elementti.
@@ -93,8 +120,8 @@ Post-publication update of Elementti.
 ## Notes
 
 * The SoftwareX-published baseline version is **v1.0.0**.
-* The current updated post-publication version is **v1.0.9**.
-* Latest version file: `Elementti_1_0_9.py`.
+* The current updated post-publication version is **v1.1.0**.
+* Latest version file: `src/elementti.py`.
 * Always check detected pixel size before final export.
 * Display min/max changes the color scale; it does not remove data.
 * Values above display max use the top color, and values below display min use the bottom color.
