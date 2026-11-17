@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.1.1
+
+Post-publication update of Elementti.
+
+### Added
+
+* **Area analysis (new optional step 8).** Draw one or more regions on a map or reference image (rectangle, square, ellipse, polygon, or freehand) and get the mean value of the selected maps, ratios, and formulas inside each region, for example steel, corrosion-product layer, and deposit. Regions can be edited, undone, deleted, or cleared. The map can be zoomed, panned, and fitted to the window.
+  * Saves a table of region values (`area_analysis.csv`), the region outlines (`area_analysis_regions.csv`), and a two-panel figure with the regions on the map and a chart comparing them.
+  * **Detail box:** zoom into part of the map and analyse only that area, with its own map, chart, and CSV outputs.
+  * **Excel report** (`.xlsx`) with the results, detailed statistics, analysis settings, and figures.
+  * **Copy results** button for pasting region values into other programs.
+* **Quick export buttons** on the Display, Line profile, and Area analysis pages to save the current map, chart, or CSV without running Generate.
+* **Group formatting** on the Display page copies chosen appearance settings from one output to other outputs.
+* **Review acquisition groups** in step 1 proposes which files belong to the same acquisition, based on metadata or shared file-name prefixes. You can check and change the selection before using it.
+* **Review import suggestions** in step 4 proposes rows to remove, columns to remove, and scale factors from each file's contents and metadata. Only the settings you tick are applied.
+* **Source file verification.** Elementti records a SHA-256 fingerprint of every input file. **Review source files** shows files that are changed, missing, or unverified, and records an explicit decision when a changed file is accepted. The project file and the Word report include this information.
+* **Save Word report** option on the Generate page. Uncheck it to skip the `.docx` report.
+
+### Changed
+
+* Elementti now has nine steps: Area analysis is step 8 and Generate is step 9.
+* The project file format was updated to version 4. Projects saved with v1.1.0 still open.
+* The Word report also includes maps, charts, area-analysis results, and source-file verification.
+* The new optional dependency `openpyxl` is needed only for Excel reports and was added to `requirements.txt`.
+
 ## v1.1.0
 
 Post-publication feature update of Elementti. The minor version number is raised because this release adds new functionality and changes which record files are saved with the outputs.
@@ -120,7 +145,7 @@ Post-publication update of Elementti.
 ## Notes
 
 * The SoftwareX-published baseline version is **v1.0.0**.
-* The current updated post-publication version is **v1.1.0**.
+* The current updated post-publication version is **v1.1.1**.
 * Latest version file: `src/elementti.py`.
 * Always check detected pixel size before final export.
 * Display min/max changes the color scale; it does not remove data.
