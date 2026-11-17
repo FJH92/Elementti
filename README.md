@@ -1,12 +1,12 @@
 # Elementti
 
-**Current version:** v1.0.9
+**Current version:** v1.1.0
 **SoftwareX published version:** v1.0.0
-**Latest version file:** `Elementti_1_0_9.py`
+**Latest version file:** `src/elementti.py`
 
 Elementti is a Python-based desktop graphical user interface (GUI) for processing and visualization of SEM-EDS elemental maps exported in CSV format.
 
-The version associated with the published SoftwareX article is **Elementti v1.0.0**. That release is preserved for reproducibility. **Elementti v1.0.9** is the current updated post-publication version.
+The version associated with the published SoftwareX article is **Elementti v1.0.0**. That release is preserved for reproducibility. **Elementti v1.1.0** is the current updated post-publication version.
 
 ## Citation
 
@@ -42,17 +42,22 @@ Elementti was developed to support more consistent and reproducible post-process
 * control line-profile tick size and text size for axis numbers, labels, title, legend, and map-panel labels
 * choose line-profile legend placement inside the plot or outside right
 * export processed CSV files and figure files
-* automatically save selected processing and visualization settings in a JSON summary file
-* generate a plain-text methods file for record keeping and reproducibility
+* save every setting in a project file (`Project.elementti.json`) and open it again later, with the same map files or with new ones
+* write `Detailed explanations.docx`, a Word document that explains every step of the run with formulas and tables and ends with a methods-section description
+* read **How it works** explanations of each method, with formulas and worked examples
+* see all eight steps in a step list and click back to any finished step
+* build a stand-alone `Elementti.exe` that runs without Python
 * load built-in fixed demo data for testing and demonstration
 
 ## Repository contents
 
-* `Elementti_1_0_9.py` – latest source file
+* `src/elementti.py` – latest source file (one file; the logo and icon are built in)
 * `sample_data/` – example CSV files for demonstration
 * `requirements.txt` – required Python packages
 * `LICENSE` – software license
 * `README.md` – project description and usage instructions
+* `CHANGELOG` – changes in each version
+* `CITATION.md` – how to cite Elementti
 
 ## Requirements
 
@@ -83,13 +88,19 @@ py -m pip install numpy matplotlib PySide6
 Run the program with:
 
 ```bash
-python Elementti_1_0_9.py
+python src/elementti.py
 ```
 
 On Windows, this may also be run with:
 
 ```bash
-py Elementti_1_0_9.py
+py src/elementti.py
+```
+
+To check the installation without opening a window, run the built-in demo check. It makes the demo outputs in a temporary folder and lists them:
+
+```bash
+python src/elementti.py --check-demo
 ```
 
 ## Windows executable
@@ -98,6 +109,14 @@ For users who do not want to run the Python source code directly, a Windows exec
 
 Use the GitHub Releases page to download the executable for the latest version when available.
 
+You can also build the executable yourself. Start Elementti from the `.py` file and click **Create Elementti.exe** on the welcome page, or run:
+
+```bash
+python src/elementti.py --make-exe
+```
+
+The program file is saved next to the source file, or in a folder given after `--make-exe`. PyInstaller is installed automatically the first time, which needs an internet connection once. On Windows, the program is signed automatically if a code-signing certificate is installed; otherwise it is left unsigned.
+
 ## Demo data
 
 Elementti includes built-in demo data for testing and demonstration.
@@ -105,6 +124,17 @@ Elementti includes built-in demo data for testing and demonstration.
 Since v1.0.8, the demo data are fixed and repeatable by default. The generated demo CSV files include metadata rows and detectable pixel-size information.
 
 Always check the detected pixel size before final export.
+
+## Projects
+
+Every time you click **Generate**, Elementti saves a project file, `Project.elementti.json`, together with the outputs. It records every setting of every step.
+
+To use it again, click **Open project** in step 1 and choose:
+
+* **Its own map files** to make the same outputs again. If the map files were moved, Elementti asks for the folder that contains them.
+* **Other map files** to use the same settings with new maps, for example another sample measured the same way. Files with identical names are matched automatically; every other map is chosen in a matching dialog.
+
+Then click **Next** through the steps. Every setting is already filled in, and you can check or change it.
 
 ## Typical workflow
 
@@ -126,8 +156,8 @@ Depending on the selected options, Elementti can export:
 
 * processed CSV files
 * figure files
-* a JSON summary file containing selected processing, visualization, size, label, and line-profile settings
-* a plain-text methods file summarizing the workflow
+* `Project.elementti.json`, a project file with every setting, which can be opened again with **Open project**
+* `Detailed explanations.docx`, a Word document that explains every step of the run in words, formulas, and tables, including what each rule changed, and ends with a description of the run that can be adapted for the methods section of a paper
 
 ## Notes on visualization
 
@@ -137,33 +167,20 @@ Values above the display maximum use the top color, and values below the display
 
 Data min and Data max are displayed rounded to at most four decimals. Disp min and Disp max accept values with at most four decimals.
 
-## Main changes in v1.0.9
+## Main changes in v1.1.0
 
-Elementti v1.0.9 is a post-publication update. Main updates since the original release include:
+Elementti v1.1.0 is a post-publication feature update. Main updates since v1.0.9:
 
-* unit-aware pixel-size handling
-* custom formula maps
-* improved formula-map interface and instructions
-* improved line-profile tools
-* optional physical-distance scaling for line-profile x-axes
-* dual y-axes for mixed element and ratio profiles
-* optional manual y-axis limits for line profiles
-* clearer colorbar and guide-bar endpoint labels
-* improved line-profile legend placement
-* fixed and repeatable demo data
-* safer export filenames to prevent accidental overwriting
-* improved Windows executable icon handling
-* updated in-app citation to the published SoftwareX reference
-* clickable DOI shown on its own line in the in-app citation
-* per-output Tick size and Text size controls for colorbar numbers and labels
-* matching Tick size and Text size controls for line-profile plots and map-panel labels
-* editable line-profile x-axis label, with clearing supported
-* shorter display-settings column headers for readability
-* rounded Data min and Data max display values
-* four-decimal input limit for Disp min and Disp max
-* more compact display-settings columns to preserve width for Bins and Bin colors
-* recording of new size, label, and x-axis-label settings in the JSON summary and methods text
-* updated icon and welcome-image resource names to `icoElementti_1_0_9.ico` and `pngElementti_1_0_9.png`, with older resource names still supported as fallbacks
+* project files (`Project.elementti.json`) that save every setting, and an **Open project** button to reuse them with the same or new map files
+* `Detailed explanations.docx`, which replaces the JSON summary and plain-text methods file
+* **How it works** windows with formulas and worked examples for each method
+* a step list for moving between the eight steps
+* a progress window while outputs are generated
+* a **Create Elementti.exe** button and a `--make-exe` command-line option for building a stand-alone program
+* a `--check-demo` command-line option for a quick check without a window
+* the logo and icon built into the source file, so one `.py` file is all that is needed
+
+See `CHANGELOG` for the full list of changes, including those in v1.0.1 to v1.0.9.
 
 ## Intended use
 
@@ -179,7 +196,7 @@ This repository contains the Elementti software associated with the SoftwareX ar
 
 Version **v1.0.0** corresponds to the published SoftwareX version and is preserved for reproducibility.
 
-Version **v1.0.9** is the current updated post-publication version and includes corrections, usability improvements, additional functionality, updated citation handling, expanded size and label controls, and improved export traceability.
+Version **v1.1.0** is the current updated post-publication version. It includes corrections, usability improvements, and additional functionality, including project files, detailed explanations of each run, and a built-in way to create a stand-alone executable.
 
 ## Author
 
